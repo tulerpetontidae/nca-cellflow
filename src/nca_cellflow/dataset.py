@@ -58,4 +58,9 @@ class IMPADataset(Dataset):
         img = np.load(path).astype(np.float32)
         img = torch.from_numpy(img).permute(2, 0, 1)        # (C, H, W)
         img = (img + torch.rand_like(img)) / 255.0           # dither + [0,1]
-        return img * 2.0 - 1.0                               # [-1, 1]
+        img = img * 2.0 - 1.0                               # [-1, 1]
+        if torch.rand(1).item() < 0.5:
+            img = img.flip(-1)                               # horizontal flip
+        if torch.rand(1).item() < 0.5:
+            img = img.flip(-2)                               # vertical flip
+        return img
