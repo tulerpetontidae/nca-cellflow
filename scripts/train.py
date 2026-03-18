@@ -228,6 +228,8 @@ def make_parser() -> argparse.ArgumentParser:
     # data
     p.add_argument("--metadata_csv", type=str, default="data/bbbc021_six/metadata/bbbc021_df_all.csv")
     p.add_argument("--image_dir", type=str, default="data/bbbc021_six")
+    p.add_argument("--image_size", type=int, default=96,
+                   help="Resize images to this size (default 96, native resolution)")
 
     # model
     p.add_argument("--nca_type", type=str, default="base",
@@ -338,6 +340,7 @@ def train(args):
         metadata_csv=args.metadata_csv,
         image_dir=args.image_dir,
         split="train",
+        image_size=args.image_size,
     )
     num_compounds = len(dataset.cpd2id)
     id2cpd = {v: k for k, v in dataset.cpd2id.items()}

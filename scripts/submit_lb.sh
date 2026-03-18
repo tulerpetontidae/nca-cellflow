@@ -23,7 +23,7 @@ ssh sherlock "cd ${PROJECT_DIR} && sbatch --job-name=${JOB_NAME} --output=${LOG_
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=24:00:00
-#SBATCH -C 'GPU_SKU:H100_SXM5'
+#SBATCH -C 'GPU_SKU:L40S|GPU_SKU:H100_SXM5'
 
 module purge
 source /home/groups/ccurtis2/alomakin/miniconda3/etc/profile.d/conda.sh

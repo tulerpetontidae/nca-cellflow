@@ -3,6 +3,7 @@
 # data
 metadata_csv: /oak/stanford/groups/ccurtis2/users/alomakin/projects/nca-cellflow/data/bbbc021_six/metadata/bbbc021_df_all.csv
 image_dir: /oak/stanford/groups/ccurtis2/users/alomakin/projects/nca-cellflow/data/bbbc021_six
+image_size: 48
 
 # model
 nca_type: noise

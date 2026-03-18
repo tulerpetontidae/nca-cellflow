@@ -12,13 +12,14 @@ Design:
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 from pathlib import Path
 
 
 class IMPADataset(Dataset):
 
-    def __init__(self, metadata_csv: str, image_dir: str, split: str = "train"):
+    def __init__(self, metadata_csv: str, image_dir: str, split: str = "train", image_size: int = 96):
         df = pd.read_csv(metadata_csv, index_col=0)
         df = df[df["SPLIT"] == split]
 
@@ -36,6 +37,7 @@ class IMPADataset(Dataset):
         self.cpd2id = {c: i for i, c in enumerate(cpds)}
 
         self.image_dir = Path(image_dir)
+        self.image_size = image_size
 
     def __len__(self):
         # one epoch = one pass over every control image
@@ -58,6 +60,8 @@ class IMPADataset(Dataset):
         img = np.load(path).astype(np.float32)
         img = torch.from_numpy(img).permute(2, 0, 1)        # (C, H, W)
         img = (img + torch.rand_like(img)) / 255.0           # dither + [0,1]
+        if self.image_size != img.shape[-1]:
+            img = F.interpolate(img.unsqueeze(0), size=self.image_size, mode="bilinear", antialias=True).squeeze(0)
         img = img * 2.0 - 1.0                               # [-1, 1]
         if torch.rand(1).item() < 0.5:
             img = img.flip(-1)                               # horizontal flip
