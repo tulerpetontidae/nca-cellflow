@@ -1,0 +1,39 @@
+# Baseline with fire_rate=0.5, large batch (128)
+
+# data
+metadata_csv: /oak/stanford/groups/ccurtis2/users/alomakin/projects/nca-cellflow/data/bbbc021_six/metadata/bbbc021_df_all.csv
+image_dir: /oak/stanford/groups/ccurtis2/users/alomakin/projects/nca-cellflow/data/bbbc021_six
+
+# model
+nca_type: base
+nca_hidden_dim: 128
+nca_cond_dim: 32
+hidden_channels: 0
+fire_rate: 0.5
+nca_steps: 60
+
+# discriminator
+d_stages: 3
+d_base_channels: 32
+d_blocks: 2
+d_cardinality: 4
+d_expansion: 2
+d_kernel_size: 3
+d_embed_dim: 32
+
+# training
+batch_size: 128
+iterations: 80000
+lr_g: 0.0002
+lr_d: 0.0002
+beta1: 0.0
+beta2: 0.99
+gamma: 1.0
+grad_clip: 1.0
+
+# misc
+num_workers: 8
+save_every: 5000
+vis_every: 1000
+checkpoint_dir: /oak/stanford/groups/ccurtis2/users/alomakin/projects/nca-cellflow/checkpoints/baseline-fire05-lb
+wandb_project: nca-cellflow

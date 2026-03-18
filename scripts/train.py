@@ -26,7 +26,7 @@ except ImportError:
     WANDB_AVAILABLE = False
 
 from nca_cellflow import IMPADataset
-from nca_cellflow.models import BaseNCA, Discriminator
+from nca_cellflow.models import BaseNCA, NoiseNCA, Discriminator
 
 
 # ---------------------------------------------------------------------------
@@ -230,10 +230,15 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--image_dir", type=str, default="data/bbbc021_six")
 
     # model
+    p.add_argument("--nca_type", type=str, default="base",
+                   choices=["base", "noise"],
+                   help="NCA variant: 'base' or 'noise' (with noise injection)")
     p.add_argument("--nca_hidden_dim", type=int, default=128)
     p.add_argument("--nca_cond_dim", type=int, default=64)
     p.add_argument("--hidden_channels", type=int, default=0,
                    help="Extra hidden channels for NCA state (0 = RGB only)")
+    p.add_argument("--noise_channels", type=int, default=1,
+                   help="Number of noise channels for NoiseNCA")
     p.add_argument("--fire_rate", type=float, default=1.0)
     p.add_argument("--nca_steps", type=int, default=60,
                    help="Number of NCA steps per generation")
@@ -354,13 +359,23 @@ def train(args):
     channel_n = img_channels + args.hidden_channels
 
     # ---- models ----
-    G = BaseNCA(
-        channel_n=channel_n,
-        hidden_dim=args.nca_hidden_dim,
-        num_classes=num_compounds,
-        cond_dim=args.nca_cond_dim,
-        fire_rate=args.fire_rate,
-    ).to(device)
+    if args.nca_type == "noise":
+        G = NoiseNCA(
+            channel_n=channel_n,
+            noise_channels=args.noise_channels,
+            hidden_dim=args.nca_hidden_dim,
+            num_classes=num_compounds,
+            cond_dim=args.nca_cond_dim,
+            fire_rate=args.fire_rate,
+        ).to(device)
+    else:
+        G = BaseNCA(
+            channel_n=channel_n,
+            hidden_dim=args.nca_hidden_dim,
+            num_classes=num_compounds,
+            cond_dim=args.nca_cond_dim,
+            fire_rate=args.fire_rate,
+        ).to(device)
 
     if args.compile:
         G = torch.compile(G)
@@ -545,8 +560,10 @@ def train(args):
                     "gamma": args.gamma,
                     "lr_g": args.lr_g,
                     "lr_d": args.lr_d,
+                    "nca_type": args.nca_type,
                     "nca_steps": args.nca_steps,
                     "hidden_channels": args.hidden_channels,
+                    "noise_channels": args.noise_channels,
                     "channel_n": channel_n,
                     "num_compounds": num_compounds,
                 },
