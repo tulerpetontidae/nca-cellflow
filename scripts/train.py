@@ -25,6 +25,12 @@ try:
 except ImportError:
     WANDB_AVAILABLE = False
 
+try:
+    from torchmetrics.image.fid import FrechetInceptionDistance
+    FID_AVAILABLE = True
+except ImportError:
+    FID_AVAILABLE = False
+
 from nca_cellflow import IMPADataset
 from nca_cellflow.models import BaseNCA, NoiseNCA, Discriminator
 
@@ -223,6 +229,85 @@ def log_visualizations(G, dataset, device, args, id2cpd, img_channels,
 
 
 # ---------------------------------------------------------------------------
+# FID Evaluation
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def compute_fid(G, dataset, device, args, id2cpd, img_channels, num_samples=5000):
+    """Compute global and per-compound FID using torchmetrics."""
+    if not FID_AVAILABLE:
+        print("[warn] torchmetrics not available, skipping FID")
+        return None, None
+
+    loader = DataLoader(
+        dataset, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, pin_memory=True, drop_last=False,
+    )
+
+    global_fid = FrechetInceptionDistance(normalize=True).to(device)
+    per_cpd_real = defaultdict(list)
+    per_cpd_fake = defaultdict(list)
+
+    G.eval()
+    n_collected = 0
+    for img_ctrl, img_trt, cpd_id in loader:
+        if n_collected >= num_samples:
+            break
+
+        img_ctrl = img_ctrl.to(device)
+        img_trt = img_trt.to(device)
+        cpd_id = cpd_id.to(device)
+
+        if args.hidden_channels > 0:
+            pad = torch.zeros(
+                img_ctrl.shape[0], args.hidden_channels,
+                img_ctrl.shape[2], img_ctrl.shape[3], device=device,
+            )
+            nca_input = torch.cat([img_ctrl, pad], dim=1)
+        else:
+            nca_input = img_ctrl
+
+        fake_full = G(nca_input, cpd_id, n_steps=args.nca_steps)
+        fake_img = fake_full[:, :img_channels].contiguous()
+
+        # [-1, 1] -> [0, 1]
+        real_01 = (img_trt.clamp(-1, 1) + 1) / 2
+        fake_01 = (fake_img.clamp(-1, 1) + 1) / 2
+
+        global_fid.update(real_01, real=True)
+        global_fid.update(fake_01, real=False)
+
+        for i in range(cpd_id.shape[0]):
+            cid = cpd_id[i].item()
+            per_cpd_real[cid].append(real_01[i].cpu())
+            per_cpd_fake[cid].append(fake_01[i].cpu())
+
+        n_collected += img_ctrl.shape[0]
+
+    fid_global = global_fid.compute().item()
+
+    # Per-compound FID
+    fid_per_cpd = {}
+    for cid in sorted(per_cpd_real.keys()):
+        real_stack = torch.stack(per_cpd_real[cid]).to(device)
+        fake_stack = torch.stack(per_cpd_fake[cid]).to(device)
+        if len(real_stack) < 2 or len(fake_stack) < 2:
+            continue
+        cpd_fid = FrechetInceptionDistance(normalize=True).to(device)
+        cpd_fid.update(real_stack, real=True)
+        cpd_fid.update(fake_stack, real=False)
+        try:
+            fid_per_cpd[id2cpd[cid]] = cpd_fid.compute().item()
+        except Exception:
+            continue
+        del cpd_fid
+        torch.cuda.empty_cache()
+
+    G.train()
+    return fid_global, fid_per_cpd
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -281,6 +366,10 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--log_every", type=int, default=5)
     p.add_argument("--vis_every", type=int, default=1000,
                    help="Log visualization plots every N steps")
+    p.add_argument("--fid_every", type=int, default=0,
+                   help="Compute FID every N steps (0 = disabled)")
+    p.add_argument("--fid_samples", type=int, default=5000,
+                   help="Number of samples for FID computation")
     p.add_argument("--checkpoint_dir", type=str, default="checkpoints")
     p.add_argument("--resume", type=str, default=None,
                    help="Path to checkpoint to resume from")
@@ -613,6 +702,26 @@ def train(args):
                 vis_G, dataset, device, args, id2cpd, img_channels,
                 fake_img, img_ctrl, img_trt, cpd_id, step + 1, use_wandb,
             )
+
+        # ============== FID ==============
+        if args.fid_every > 0 and (step + 1) % args.fid_every == 0:
+            fid_G = G_ema.module if use_ema else G
+            fid_global, fid_per_cpd = compute_fid(
+                fid_G, dataset, device, args, id2cpd, img_channels,
+                num_samples=args.fid_samples,
+            )
+            if fid_global is not None:
+                fid_log = {"fid/global": fid_global}
+                fid_vals = []
+                for cpd_name, fid_val in fid_per_cpd.items():
+                    fid_log[f"fid/cpd/{cpd_name}"] = fid_val
+                    fid_vals.append(fid_val)
+                if fid_vals:
+                    fid_log["fid/mean_per_cpd"] = np.mean(fid_vals)
+                print(f"[FID] global={fid_global:.2f}  mean_per_cpd={np.mean(fid_vals):.2f}")
+                if use_wandb:
+                    wandb.log(fid_log, step=step + 1)
+                logs["fid/global"].append(fid_global)
 
         # ============== Checkpointing ==============
         is_save_step = (step + 1) % args.save_every == 0
