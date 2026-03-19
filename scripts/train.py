@@ -60,7 +60,7 @@ def to_rgb_numpy(img: torch.Tensor) -> np.ndarray:
 # Checkpointing
 # ---------------------------------------------------------------------------
 
-def save_checkpoint(path, step, G, D, G_opt, D_opt, logs, extra=None):
+def save_checkpoint(path, step, G, D, G_opt, D_opt, logs, extra=None, G_ema=None):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     state = {
         "step": step,
@@ -71,11 +71,13 @@ def save_checkpoint(path, step, G, D, G_opt, D_opt, logs, extra=None):
         "logs": dict(logs),
         "extra": extra,
     }
+    if G_ema is not None:
+        state["G_ema_state"] = G_ema.state_dict()
     torch.save(state, path)
     print(f"[ckpt] saved {path}")
 
 
-def load_checkpoint(path, G, D, G_opt=None, D_opt=None, map_location=None):
+def load_checkpoint(path, G, D, G_opt=None, D_opt=None, G_ema=None, map_location=None):
     ckpt = torch.load(path, map_location=map_location, weights_only=False)
     G.load_state_dict(ckpt["G_state"])
     D.load_state_dict(ckpt["D_state"])
@@ -83,6 +85,8 @@ def load_checkpoint(path, G, D, G_opt=None, D_opt=None, map_location=None):
         G_opt.load_state_dict(ckpt["G_opt_state"])
     if D_opt is not None and "D_opt_state" in ckpt:
         D_opt.load_state_dict(ckpt["D_opt_state"])
+    if G_ema is not None and "G_ema_state" in ckpt:
+        G_ema.load_state_dict(ckpt["G_ema_state"])
     logs = defaultdict(list, ckpt.get("logs", {}))
     step = ckpt.get("step", 0)
     extra = ckpt.get("extra", None)
@@ -264,6 +268,12 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--gamma", type=float, default=1.0,
                    help="Gradient penalty weight")
     p.add_argument("--grad_clip", type=float, default=1.0)
+    p.add_argument("--accumulate_steps", type=int, default=1,
+                   help="Gradient accumulation steps (effective batch = batch_size * accumulate_steps)")
+    p.add_argument("--ema_decay", type=float, default=0.0,
+                   help="EMA decay for generator (0 = disabled, e.g. 0.999)")
+    p.add_argument("--ema_warmup_steps", type=int, default=1000,
+                   help="EMA warmup steps (ramp decay from 0 to ema_decay)")
 
     # misc
     p.add_argument("--num_workers", type=int, default=4)
@@ -380,6 +390,21 @@ def train(args):
             fire_rate=args.fire_rate,
         ).to(device)
 
+    # ---- EMA ----
+    use_ema = args.ema_decay > 0
+    if use_ema:
+        ema_decay = args.ema_decay
+        ema_warmup = args.ema_warmup_steps
+
+        def _ema_avg_fn(avg_param, model_param, num_averaged):
+            decay = min(ema_decay, (1 + num_averaged) / (ema_warmup + num_averaged))
+            return avg_param + (1 - decay) * (model_param - avg_param)
+
+        G_ema = torch.optim.swa_utils.AveragedModel(G, avg_fn=_ema_avg_fn)
+        print(f"EMA enabled (decay={ema_decay}, warmup={ema_warmup})")
+    else:
+        G_ema = None
+
     if args.compile:
         G = torch.compile(G)
 
@@ -423,7 +448,7 @@ def train(args):
 
     if args.resume:
         start_step, logs, extra = load_checkpoint(
-            args.resume, G, D, G_opt, D_opt, map_location=device
+            args.resume, G, D, G_opt, D_opt, G_ema=G_ema, map_location=device
         )
         print(f"Resuming from step {start_step}")
 
@@ -450,24 +475,9 @@ def train(args):
             return next(data_iter)
 
     # ---- training loop ----
+    accum = args.accumulate_steps
     pbar = tqdm(range(start_step, args.iterations), desc="Training", initial=start_step, total=args.iterations)
     for step in pbar:
-        img_ctrl, img_trt, cpd_id = next_batch()
-        img_ctrl = img_ctrl.to(device)
-        img_trt = img_trt.to(device)
-        cpd_id = cpd_id.to(device)
-
-        # If using hidden channels, pad ctrl with zeros
-        if args.hidden_channels > 0:
-            pad = torch.zeros(
-                img_ctrl.shape[0], args.hidden_channels,
-                img_ctrl.shape[2], img_ctrl.shape[3],
-                device=device,
-            )
-            nca_input = torch.cat([img_ctrl, pad], dim=1)
-        else:
-            nca_input = img_ctrl
-
         G.train()
         D.train()
 
@@ -476,26 +486,58 @@ def train(args):
         set_requires_grad(D, True)
         D_opt.zero_grad(set_to_none=True)
 
-        with torch.no_grad():
-            fake_full = G(nca_input, cpd_id, n_steps=args.nca_steps)
-            fake_img = fake_full[:, :img_channels].contiguous()
+        accum_d_loss = 0.0
+        accum_adv_d = 0.0
+        accum_reg = 0.0
+        accum_gp_real = 0.0
+        accum_gp_fake = 0.0
+        accum_d_real = 0.0
+        accum_d_fake = 0.0
 
-        real_req = img_trt.detach().requires_grad_(True)
-        fake_req = fake_img.detach().requires_grad_(True)
+        for _ in range(accum):
+            img_ctrl, img_trt, cpd_id = next_batch()
+            img_ctrl = img_ctrl.to(device)
+            img_trt = img_trt.to(device)
+            cpd_id = cpd_id.to(device)
 
-        with autocast():
-            d_real = D(real_req, cpd_id)
-            d_fake = D(fake_req, cpd_id)
-            rel = d_real - d_fake
-            adv_d = F.softplus(-rel).mean()
+            if args.hidden_channels > 0:
+                pad = torch.zeros(
+                    img_ctrl.shape[0], args.hidden_channels,
+                    img_ctrl.shape[2], img_ctrl.shape[3],
+                    device=device,
+                )
+                nca_input = torch.cat([img_ctrl, pad], dim=1)
+            else:
+                nca_input = img_ctrl
 
-        # Gradient penalty in fp32 for stability
-        gp_real = zero_centered_gradient_penalty(real_req.float(), d_real.float())
-        gp_fake = zero_centered_gradient_penalty(fake_req.float(), d_fake.float())
-        reg = 0.5 * args.gamma * (gp_real.mean() + gp_fake.mean())
+            with torch.no_grad():
+                fake_full = G(nca_input, cpd_id, n_steps=args.nca_steps)
+                fake_img = fake_full[:, :img_channels].contiguous()
 
-        d_loss = adv_d + reg
-        d_loss.backward()
+            real_req = img_trt.detach().requires_grad_(True)
+            fake_req = fake_img.detach().requires_grad_(True)
+
+            with autocast():
+                d_real = D(real_req, cpd_id)
+                d_fake = D(fake_req, cpd_id)
+                rel = d_real - d_fake
+                adv_d = F.softplus(-rel).mean()
+
+            gp_real = zero_centered_gradient_penalty(real_req.float(), d_real.float())
+            gp_fake = zero_centered_gradient_penalty(fake_req.float(), d_fake.float())
+            reg = 0.5 * args.gamma * (gp_real.mean() + gp_fake.mean())
+
+            d_loss = (adv_d + reg) / accum
+            d_loss.backward()
+
+            accum_d_loss += d_loss.item()
+            accum_adv_d += adv_d.item() / accum
+            accum_reg += reg.item() / accum
+            accum_gp_real += gp_real.mean().item() / accum
+            accum_gp_fake += gp_fake.mean().item() / accum
+            accum_d_real += d_real.mean().item() / accum
+            accum_d_fake += d_fake.mean().item() / accum
+
         D_opt.step()
 
         # ============== Generator step ==============
@@ -503,30 +545,53 @@ def train(args):
         set_requires_grad(D, False)
         G_opt.zero_grad(set_to_none=True)
 
-        with autocast():
-            fake_full = G(nca_input, cpd_id, n_steps=args.nca_steps)
-            fake_img = fake_full[:, :img_channels].contiguous()
+        accum_g_loss = 0.0
 
-            d_real = D(img_trt.detach(), cpd_id)
-            d_fake = D(fake_img, cpd_id)
+        for _ in range(accum):
+            img_ctrl, img_trt, cpd_id = next_batch()
+            img_ctrl = img_ctrl.to(device)
+            img_trt = img_trt.to(device)
+            cpd_id = cpd_id.to(device)
 
-        rel = d_fake - d_real
-        g_loss = F.softplus(-rel).mean()
+            if args.hidden_channels > 0:
+                pad = torch.zeros(
+                    img_ctrl.shape[0], args.hidden_channels,
+                    img_ctrl.shape[2], img_ctrl.shape[3],
+                    device=device,
+                )
+                nca_input = torch.cat([img_ctrl, pad], dim=1)
+            else:
+                nca_input = img_ctrl
 
-        g_loss.backward()
+            with autocast():
+                fake_full = G(nca_input, cpd_id, n_steps=args.nca_steps)
+                fake_img = fake_full[:, :img_channels].contiguous()
+
+                d_real = D(img_trt.detach(), cpd_id)
+                d_fake = D(fake_img, cpd_id)
+
+            rel = d_fake - d_real
+            g_loss = F.softplus(-rel).mean() / accum
+
+            g_loss.backward()
+            accum_g_loss += g_loss.item()
+
         nn_utils.clip_grad_norm_(G.parameters(), max_norm=args.grad_clip)
         G_opt.step()
 
+        if use_ema:
+            G_ema.update_parameters(G)
+
         # ============== Logging ==============
         log_dict = {
-            "loss/D_total": d_loss.item(),
-            "loss/D_adv": adv_d.item(),
-            "loss/D_reg": reg.item(),
-            "penalty/gp_real_mean": gp_real.mean().item(),
-            "penalty/gp_fake_mean": gp_fake.mean().item(),
-            "logits/D_real_mean": d_real.mean().item(),
-            "logits/D_fake_mean": d_fake.mean().item(),
-            "loss/G": g_loss.item(),
+            "loss/D_total": accum_d_loss,
+            "loss/D_adv": accum_adv_d,
+            "loss/D_reg": accum_reg,
+            "penalty/gp_real_mean": accum_gp_real,
+            "penalty/gp_fake_mean": accum_gp_fake,
+            "logits/D_real_mean": accum_d_real,
+            "logits/D_fake_mean": accum_d_fake,
+            "loss/G": accum_g_loss,
         }
         for k, v in log_dict.items():
             logs[k].append(v)
@@ -536,15 +601,16 @@ def train(args):
 
         if step % args.log_every == 0:
             pbar.set_postfix({
-                "d": f"{d_loss.item():.4f}",
-                "g": f"{g_loss.item():.4f}",
-                "gp_r": f"{gp_real.mean().item():.2f}",
+                "d": f"{accum_d_loss:.4f}",
+                "g": f"{accum_g_loss:.4f}",
+                "gp_r": f"{accum_gp_real:.2f}",
             })
 
         # ============== Visualizations ==============
         if (step + 1) % args.vis_every == 0:
+            vis_G = G_ema.module if use_ema else G
             log_visualizations(
-                G, dataset, device, args, id2cpd, img_channels,
+                vis_G, dataset, device, args, id2cpd, img_channels,
                 fake_img, img_ctrl, img_trt, cpd_id, step + 1, use_wandb,
             )
 
@@ -559,6 +625,7 @@ def train(args):
                 G=G, D=D,
                 G_opt=G_opt, D_opt=D_opt,
                 logs=logs,
+                G_ema=G_ema,
                 extra={
                     "gamma": args.gamma,
                     "lr_g": args.lr_g,
@@ -569,6 +636,8 @@ def train(args):
                     "noise_channels": args.noise_channels,
                     "channel_n": channel_n,
                     "num_compounds": num_compounds,
+                    "ema_decay": args.ema_decay,
+                    "ema_warmup_steps": args.ema_warmup_steps,
                 },
             )
 
