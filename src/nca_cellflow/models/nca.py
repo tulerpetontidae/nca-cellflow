@@ -75,11 +75,13 @@ class BaseNCA(nn.Module):
         num_classes: int = 1,
         cond_dim: int = 64,
         fire_rate: float = 1.0,
+        step_size: float = 0.1,
     ):
         super().__init__()
         self.channel_n = channel_n
         self.hidden_dim = hidden_dim
         self.fire_rate = fire_rate
+        self.step_size = step_size
         self.sensor = GradientSensor(channel_n)
 
         # Compound embedding: id -> vector
@@ -138,7 +140,7 @@ class BaseNCA(nn.Module):
             mask = (torch.rand(B, 1, H, W, device=x.device) < self.fire_rate).float()
             dx = dx * mask
 
-        return x + dx * 0.1
+        return x + dx * self.step_size
 
     def forward(self, x, cond, n_steps: int = 1):
         """Apply n_steps NCA updates."""
@@ -198,12 +200,14 @@ class NoiseNCA(nn.Module):
         num_classes: int = 1,
         cond_dim: int = 64,
         fire_rate: float = 1.0,
+        step_size: float = 0.1,
     ):
         super().__init__()
         self.channel_n = channel_n
         self.noise_channels = noise_channels
         self.hidden_dim = hidden_dim
         self.fire_rate = fire_rate
+        self.step_size = step_size
 
         self.sensor = GradientSensor(channel_n)
 
@@ -253,7 +257,7 @@ class NoiseNCA(nn.Module):
             mask = (torch.rand(B, 1, H, W, device=x.device) < self.fire_rate).float()
             dx = dx * mask
 
-        return x + dx * 0.1
+        return x + dx * self.step_size
 
     def forward(self, x, cond, n_steps: int = 1):
         for _ in range(n_steps):

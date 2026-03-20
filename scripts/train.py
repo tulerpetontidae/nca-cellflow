@@ -24,12 +24,14 @@ try:
     WANDB_AVAILABLE = True
 except ImportError:
     WANDB_AVAILABLE = False
+    print("[warn] wandb not installed")
 
 try:
     from torchmetrics.image.fid import FrechetInceptionDistance
     FID_AVAILABLE = True
 except ImportError:
     FID_AVAILABLE = False
+    print("[warn] torchmetrics not installed — FID evaluation disabled")
 
 from nca_cellflow import IMPADataset
 from nca_cellflow.models import BaseNCA, NoiseNCA, Discriminator
@@ -232,79 +234,93 @@ def log_visualizations(G, dataset, device, args, id2cpd, img_channels,
 # FID Evaluation
 # ---------------------------------------------------------------------------
 
+_global_fid = None
+_cpd_fid = None
+
+
 @torch.no_grad()
 def compute_fid(G, dataset, device, args, id2cpd, img_channels, num_samples=5000):
     """Compute global and per-compound FID using torchmetrics."""
+    global _global_fid, _cpd_fid
     if not FID_AVAILABLE:
         print("[warn] torchmetrics not available, skipping FID")
         return None, None
 
-    loader = DataLoader(
-        dataset, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=True, drop_last=False,
-    )
+    try:
+        if _global_fid is None:
+            _global_fid = FrechetInceptionDistance(normalize=True).to(device)
+            _cpd_fid = FrechetInceptionDistance(normalize=True).to(device)
 
-    global_fid = FrechetInceptionDistance(normalize=True).to(device)
-    per_cpd_real = defaultdict(list)
-    per_cpd_fake = defaultdict(list)
+        loader = DataLoader(
+            dataset, batch_size=args.batch_size, shuffle=True,
+            num_workers=0, pin_memory=False, drop_last=False,
+        )
 
-    G.eval()
-    n_collected = 0
-    for img_ctrl, img_trt, cpd_id in loader:
-        if n_collected >= num_samples:
-            break
+        _global_fid.reset()
+        per_cpd_real = defaultdict(list)
+        per_cpd_fake = defaultdict(list)
 
-        img_ctrl = img_ctrl.to(device)
-        img_trt = img_trt.to(device)
-        cpd_id = cpd_id.to(device)
+        G.eval()
+        n_collected = 0
+        for img_ctrl, img_trt, cpd_id in loader:
+            if n_collected >= num_samples:
+                break
 
-        if args.hidden_channels > 0:
-            pad = torch.zeros(
-                img_ctrl.shape[0], args.hidden_channels,
-                img_ctrl.shape[2], img_ctrl.shape[3], device=device,
-            )
-            nca_input = torch.cat([img_ctrl, pad], dim=1)
-        else:
-            nca_input = img_ctrl
+            img_ctrl = img_ctrl.to(device)
+            img_trt = img_trt.to(device)
+            cpd_id = cpd_id.to(device)
 
-        fake_full = G(nca_input, cpd_id, n_steps=args.nca_steps)
-        fake_img = fake_full[:, :img_channels].contiguous()
+            if args.hidden_channels > 0:
+                pad = torch.zeros(
+                    img_ctrl.shape[0], args.hidden_channels,
+                    img_ctrl.shape[2], img_ctrl.shape[3], device=device,
+                )
+                nca_input = torch.cat([img_ctrl, pad], dim=1)
+            else:
+                nca_input = img_ctrl
 
-        # [-1, 1] -> [0, 1]
-        real_01 = (img_trt.clamp(-1, 1) + 1) / 2
-        fake_01 = (fake_img.clamp(-1, 1) + 1) / 2
+            fake_full = G(nca_input, cpd_id, n_steps=args.nca_steps)
+            fake_img = fake_full[:, :img_channels].contiguous()
 
-        global_fid.update(real_01, real=True)
-        global_fid.update(fake_01, real=False)
+            # [-1, 1] -> [0, 1]
+            real_01 = (img_trt.clamp(-1, 1) + 1) / 2
+            fake_01 = (fake_img.clamp(-1, 1) + 1) / 2
 
-        for i in range(cpd_id.shape[0]):
-            cid = cpd_id[i].item()
-            per_cpd_real[cid].append(real_01[i].cpu())
-            per_cpd_fake[cid].append(fake_01[i].cpu())
+            _global_fid.update(real_01, real=True)
+            _global_fid.update(fake_01, real=False)
 
-        n_collected += img_ctrl.shape[0]
+            for i in range(cpd_id.shape[0]):
+                cid = cpd_id[i].item()
+                per_cpd_real[cid].append(real_01[i].cpu())
+                per_cpd_fake[cid].append(fake_01[i].cpu())
 
-    fid_global = global_fid.compute().item()
+            n_collected += img_ctrl.shape[0]
 
-    # Per-compound FID
-    fid_per_cpd = {}
-    for cid in sorted(per_cpd_real.keys()):
-        real_stack = torch.stack(per_cpd_real[cid]).to(device)
-        fake_stack = torch.stack(per_cpd_fake[cid]).to(device)
-        if len(real_stack) < 2 or len(fake_stack) < 2:
-            continue
-        cpd_fid = FrechetInceptionDistance(normalize=True).to(device)
-        cpd_fid.update(real_stack, real=True)
-        cpd_fid.update(fake_stack, real=False)
-        try:
-            fid_per_cpd[id2cpd[cid]] = cpd_fid.compute().item()
-        except Exception:
-            continue
-        del cpd_fid
+        fid_global = _global_fid.compute().item()
+
+        # Per-compound FID
+        fid_per_cpd = {}
+        for cid in sorted(per_cpd_real.keys()):
+            real_stack = torch.stack(per_cpd_real[cid]).to(device)
+            fake_stack = torch.stack(per_cpd_fake[cid]).to(device)
+            if len(real_stack) < 2 or len(fake_stack) < 2:
+                continue
+            _cpd_fid.reset()
+            _cpd_fid.update(real_stack, real=True)
+            _cpd_fid.update(fake_stack, real=False)
+            try:
+                fid_per_cpd[id2cpd[cid]] = _cpd_fid.compute().item()
+            except Exception:
+                continue
+
+        G.train()
+        return fid_global, fid_per_cpd
+
+    except Exception as e:
+        print(f"[warn] FID computation failed: {e}")
+        G.train()
         torch.cuda.empty_cache()
-
-    G.train()
-    return fid_global, fid_per_cpd
+        return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +347,8 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--noise_channels", type=int, default=1,
                    help="Number of noise channels for NoiseNCA")
     p.add_argument("--fire_rate", type=float, default=1.0)
+    p.add_argument("--step_size", type=float, default=0.1,
+                   help="Residual update scale: x = x + dx * step_size")
     p.add_argument("--nca_steps", type=int, default=60,
                    help="Number of NCA steps per generation")
 
@@ -353,6 +371,8 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--gamma", type=float, default=1.0,
                    help="Gradient penalty weight")
     p.add_argument("--grad_clip", type=float, default=1.0)
+    p.add_argument("--diversity_weight", type=float, default=0.0,
+                   help="Weight for diversity loss (0 = disabled). Penalizes identical outputs from different noise.")
     p.add_argument("--accumulate_steps", type=int, default=1,
                    help="Gradient accumulation steps (effective batch = batch_size * accumulate_steps)")
     p.add_argument("--ema_decay", type=float, default=0.0,
@@ -415,6 +435,9 @@ def load_config_into_args(args):
 
 def train(args):
     args = load_config_into_args(args)
+    print(f"[config] ema_decay={args.ema_decay}, fid_every={args.fid_every}, "
+          f"accumulate_steps={args.accumulate_steps}, nca_type={args.nca_type}, "
+          f"diversity_weight={args.diversity_weight}")
 
     # ---- wandb ----
     use_wandb = args.wandb and WANDB_AVAILABLE
@@ -469,6 +492,7 @@ def train(args):
             num_classes=num_compounds,
             cond_dim=args.nca_cond_dim,
             fire_rate=args.fire_rate,
+            step_size=args.step_size,
         ).to(device)
     else:
         G = BaseNCA(
@@ -477,6 +501,7 @@ def train(args):
             num_classes=num_compounds,
             cond_dim=args.nca_cond_dim,
             fire_rate=args.fire_rate,
+            step_size=args.step_size,
         ).to(device)
 
     # ---- EMA ----
@@ -544,10 +569,14 @@ def train(args):
     os.makedirs(args.checkpoint_dir, exist_ok=True)
 
     # ---- wandb init ----
+    wandb_run_id = None
+    if args.resume and extra and isinstance(extra, dict):
+        wandb_run_id = extra.get("wandb_run_id", None)
     if use_wandb:
         wandb.init(
             project=args.wandb_project,
             name=args.wandb_name,
+            id=wandb_run_id,
             config=vars(args),
             resume="allow" if args.resume else None,
         )
@@ -570,19 +599,8 @@ def train(args):
         G.train()
         D.train()
 
-        # ============== Discriminator step ==============
-        set_requires_grad(G, False)
-        set_requires_grad(D, True)
-        D_opt.zero_grad(set_to_none=True)
-
-        accum_d_loss = 0.0
-        accum_adv_d = 0.0
-        accum_reg = 0.0
-        accum_gp_real = 0.0
-        accum_gp_fake = 0.0
-        accum_d_real = 0.0
-        accum_d_fake = 0.0
-
+        # ============== Sample shared batches for D and G ==============
+        shared_batches = []
         for _ in range(accum):
             img_ctrl, img_trt, cpd_id = next_batch()
             img_ctrl = img_ctrl.to(device)
@@ -599,6 +617,22 @@ def train(args):
             else:
                 nca_input = img_ctrl
 
+            shared_batches.append((nca_input, img_trt, cpd_id))
+
+        # ============== Discriminator step ==============
+        set_requires_grad(G, False)
+        set_requires_grad(D, True)
+        D_opt.zero_grad(set_to_none=True)
+
+        accum_d_loss = 0.0
+        accum_adv_d = 0.0
+        accum_reg = 0.0
+        accum_gp_real = 0.0
+        accum_gp_fake = 0.0
+        accum_d_real = 0.0
+        accum_d_fake = 0.0
+
+        for nca_input, img_trt, cpd_id in shared_batches:
             with torch.no_grad():
                 fake_full = G(nca_input, cpd_id, n_steps=args.nca_steps)
                 fake_img = fake_full[:, :img_channels].contiguous()
@@ -635,23 +669,9 @@ def train(args):
         G_opt.zero_grad(set_to_none=True)
 
         accum_g_loss = 0.0
+        accum_div_loss = 0.0
 
-        for _ in range(accum):
-            img_ctrl, img_trt, cpd_id = next_batch()
-            img_ctrl = img_ctrl.to(device)
-            img_trt = img_trt.to(device)
-            cpd_id = cpd_id.to(device)
-
-            if args.hidden_channels > 0:
-                pad = torch.zeros(
-                    img_ctrl.shape[0], args.hidden_channels,
-                    img_ctrl.shape[2], img_ctrl.shape[3],
-                    device=device,
-                )
-                nca_input = torch.cat([img_ctrl, pad], dim=1)
-            else:
-                nca_input = img_ctrl
-
+        for nca_input, img_trt, cpd_id in shared_batches:
             with autocast():
                 fake_full = G(nca_input, cpd_id, n_steps=args.nca_steps)
                 fake_img = fake_full[:, :img_channels].contiguous()
@@ -662,7 +682,18 @@ def train(args):
             rel = d_fake - d_real
             g_loss = F.softplus(-rel).mean() / accum
 
-            g_loss.backward()
+            # Diversity loss: penalize identical outputs from different noise
+            if args.diversity_weight > 0:
+                with autocast():
+                    fake_full2 = G(nca_input, cpd_id, n_steps=args.nca_steps)
+                    fake_img2 = fake_full2[:, :img_channels].contiguous()
+                div_loss = -torch.mean(torch.abs(fake_img - fake_img2)) / accum
+                total_loss = g_loss + args.diversity_weight * div_loss
+                total_loss.backward()
+                accum_div_loss += div_loss.item()
+            else:
+                g_loss.backward()
+
             accum_g_loss += g_loss.item()
 
         nn_utils.clip_grad_norm_(G.parameters(), max_norm=args.grad_clip)
@@ -682,6 +713,8 @@ def train(args):
             "logits/D_fake_mean": accum_d_fake,
             "loss/G": accum_g_loss,
         }
+        if args.diversity_weight > 0:
+            log_dict["loss/diversity"] = accum_div_loss
         for k, v in log_dict.items():
             logs[k].append(v)
 
@@ -698,9 +731,11 @@ def train(args):
         # ============== Visualizations ==============
         if (step + 1) % args.vis_every == 0:
             vis_G = G_ema.module if use_ema else G
+            # Use last shared batch for visualization
+            vis_nca_input, vis_img_trt, vis_cpd_id = shared_batches[-1]
             log_visualizations(
                 vis_G, dataset, device, args, id2cpd, img_channels,
-                fake_img, img_ctrl, img_trt, cpd_id, step + 1, use_wandb,
+                fake_img, vis_nca_input, vis_img_trt, vis_cpd_id, step + 1, use_wandb,
             )
 
         # ============== FID ==============
@@ -747,6 +782,9 @@ def train(args):
                     "num_compounds": num_compounds,
                     "ema_decay": args.ema_decay,
                     "ema_warmup_steps": args.ema_warmup_steps,
+                    "diversity_weight": args.diversity_weight,
+                    "step_size": args.step_size,
+                    "wandb_run_id": wandb.run.id if use_wandb else None,
                 },
             )
 
