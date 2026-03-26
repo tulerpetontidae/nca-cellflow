@@ -1,0 +1,46 @@
+# CellFlux baseline matching paper settings (cfg_scale=1.2)
+# Paper: noise_prob=0.5, class_drop_prob=0.2, cfg_scale=1.2
+
+# data
+metadata_csv: /oak/stanford/groups/ccurtis2/users/alomakin/projects/nca-cellflow/data/bbbc021_six/metadata/bbbc021_df_all.csv
+image_dir: /oak/stanford/groups/ccurtis2/users/alomakin/projects/nca-cellflow/data/bbbc021_six
+image_size: 48
+plate_match: true
+fp_path: /oak/stanford/groups/ccurtis2/users/alomakin/projects/nca-cellflow/data/bbbc021_six/metadata/emb_morgan_fp.csv
+
+# model
+model_channels: 128
+num_res_blocks: 4
+dropout: 0.3
+channel_mult: [2, 2, 2]
+attention_resolutions: [2]
+condition_dim: 1024
+
+# flow matching
+noise_level: 0.5
+noise_prob: 0.5
+class_drop_prob: 0.2
+cfg_scale: 1.2
+skewed_timesteps: true
+edm_schedule: true
+ode_method: heun
+ode_nfe: 50
+
+# training
+batch_size: 128
+iterations: 80000
+lr: 0.0001
+beta1: 0.9
+beta2: 0.95
+grad_clip: 1.0
+ema_decay: 0.999
+ema_warmup_steps: 1000
+
+# misc
+num_workers: 8
+save_every: 5000
+vis_every: 5000
+fid_every: 5000
+val_fid: true
+checkpoint_dir: /oak/stanford/groups/ccurtis2/users/alomakin/projects/nca-cellflow/checkpoints/cellflux-bbbc021-paper-lb
+wandb_project: nca-cellflow
