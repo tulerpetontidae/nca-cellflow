@@ -148,17 +148,86 @@ class IMPADataset(Dataset):
         img_ctrl = self._load(self.ctrl_keys[ci])
         return img_ctrl, img_trt, cpd_id
 
-    def _load(self, key: str) -> torch.Tensor:
+    def _load(self, key: str, augment: bool = True) -> torch.Tensor:
         parts = key.split("_")
         path = self.image_dir / parts[0] / parts[1] / ("_".join(parts[2:]) + ".npy")
         img = np.load(path).astype(np.float32)
         img = torch.from_numpy(img).permute(2, 0, 1)        # (C, H, W)
-        img = (img + torch.rand_like(img)) / 255.0           # dither + [0,1]
+        if augment:
+            img = (img + torch.rand_like(img)) / 255.0       # dither + [0,1]
+        else:
+            img = (img + 0.5) / 255.0                        # center of bin, no noise
         if self.image_size != img.shape[-1]:
             img = F.interpolate(img.unsqueeze(0), size=self.image_size, mode="bilinear", antialias=True).squeeze(0)
         img = img * 2.0 - 1.0                               # [-1, 1]
-        if torch.rand(1).item() < 0.5:
-            img = img.flip(-1)                               # horizontal flip
-        if torch.rand(1).item() < 0.5:
-            img = img.flip(-2)                               # vertical flip
+        if augment:
+            if torch.rand(1).item() < 0.5:
+                img = img.flip(-1)                           # horizontal flip
+            if torch.rand(1).item() < 0.5:
+                img = img.flip(-2)                           # vertical flip
+        return img
+
+
+class EvalDataset(Dataset):
+    """Deterministic dataset for FID evaluation.
+
+    Always iterates over treated images. Each treated image is paired with a
+    deterministic same-plate ctrl (seeded by index). No augmentation.
+    """
+
+    def __init__(self, metadata_csv: str, image_dir: str, split: str = "test",
+                 image_size: int = 96):
+        df = pd.read_csv(metadata_csv, index_col=0)
+        df = df[df["SPLIT"] == split]
+
+        ctrl = df[df["STATE"] == 0]
+        trt = df[df["STATE"] == 1]
+
+        self.ctrl_keys = ctrl["SAMPLE_KEY"].values
+        self.trt_keys = trt["SAMPLE_KEY"].values
+        self.trt_cpd = trt["CPD_NAME"].values
+
+        cpds = sorted(set(self.trt_cpd))
+        self.cpd2id = {c: i for i, c in enumerate(cpds)}
+
+        self.image_dir = Path(image_dir)
+        self.image_size = image_size
+
+        # Build per-plate ctrl index for deterministic pairing
+        self._trt_plates = np.array([_plate_from_key(k) for k in self.trt_keys])
+        self._plate_to_ctrl_idx = {}
+        for i, key in enumerate(self.ctrl_keys):
+            plate = _plate_from_key(key)
+            self._plate_to_ctrl_idx.setdefault(plate, []).append(i)
+        # Sort for determinism
+        for plate in self._plate_to_ctrl_idx:
+            self._plate_to_ctrl_idx[plate] = sorted(self._plate_to_ctrl_idx[plate])
+
+    def __len__(self):
+        return len(self.trt_keys)
+
+    def __getitem__(self, idx):
+        img_trt = self._load(self.trt_keys[idx])
+        cpd_id = self.cpd2id[self.trt_cpd[idx]]
+
+        # Deterministic ctrl: pick from same plate using idx as seed
+        plate = self._trt_plates[idx]
+        pool = self._plate_to_ctrl_idx.get(plate)
+        if pool is not None and len(pool) > 0:
+            ci = pool[idx % len(pool)]
+        else:
+            ci = idx % len(self.ctrl_keys)
+        img_ctrl = self._load(self.ctrl_keys[ci])
+
+        return img_ctrl, img_trt, cpd_id
+
+    def _load(self, key: str) -> torch.Tensor:
+        parts = key.split("_")
+        path = self.image_dir / parts[0] / parts[1] / ("_".join(parts[2:]) + ".npy")
+        img = np.load(path).astype(np.float32)
+        img = torch.from_numpy(img).permute(2, 0, 1)
+        img = (img + 0.5) / 255.0                           # center of bin, no noise
+        if self.image_size != img.shape[-1]:
+            img = F.interpolate(img.unsqueeze(0), size=self.image_size, mode="bilinear", antialias=True).squeeze(0)
+        img = img * 2.0 - 1.0                               # [-1, 1]
         return img

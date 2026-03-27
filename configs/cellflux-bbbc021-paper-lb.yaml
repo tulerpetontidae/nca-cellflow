@@ -6,6 +6,7 @@ metadata_csv: /oak/stanford/groups/ccurtis2/users/alomakin/projects/nca-cellflow
 image_dir: /oak/stanford/groups/ccurtis2/users/alomakin/projects/nca-cellflow/data/bbbc021_six
 image_size: 48
 plate_match: true
+iter_trt: true
 fp_path: /oak/stanford/groups/ccurtis2/users/alomakin/projects/nca-cellflow/data/bbbc021_six/metadata/emb_morgan_fp.csv
 
 # model
@@ -41,6 +42,5 @@ num_workers: 8
 save_every: 5000
 vis_every: 5000
 fid_every: 5000
-val_fid: true
 checkpoint_dir: /oak/stanford/groups/ccurtis2/users/alomakin/projects/nca-cellflow/checkpoints/cellflux-bbbc021-paper-lb
 wandb_project: nca-cellflow

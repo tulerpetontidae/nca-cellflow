@@ -15,6 +15,9 @@ rsync -avz --progress \
     --exclude 'checkpoints/' \
     --exclude '*.egg-info' \
     --exclude '.DS_Store' \
+    --exclude 'data/*' \
+    --exclude 'notebooks/*' \
+    --exclude 'figures/*' \
     ./ "${REMOTE}/"
 
 echo "Deploy complete."

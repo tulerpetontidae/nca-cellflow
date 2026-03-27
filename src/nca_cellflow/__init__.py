@@ -7,6 +7,6 @@ using BBBC021 dataset.
 
 __version__ = "0.1.0"
 
-from .dataset import IMPADataset
+from .dataset import IMPADataset, EvalDataset
 
-__all__ = ["IMPADataset", "__version__"]
+__all__ = ["IMPADataset", "EvalDataset", "__version__"]

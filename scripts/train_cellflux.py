@@ -37,7 +37,7 @@ except ImportError:
     FID_AVAILABLE = False
     print("[warn] torchmetrics not installed — FID evaluation disabled")
 
-from nca_cellflow import IMPADataset
+from nca_cellflow import IMPADataset, EvalDataset
 from nca_cellflow.models.cellflux_unet import (
     CellFluxUNet, ode_sample_heun, ode_sample_midpoint, ode_sample_euler,
     edm_time_grid, skewed_timestep_sample,
@@ -313,10 +313,17 @@ _cpd_fid = None
 
 
 @torch.no_grad()
-def compute_fid(model, dataset, device, args, id2cpd, fp_matrix,
-                ode_fn, time_grid, cfg_scale, num_samples=5000):
+def compute_fid(model, eval_dataset, device, args, id2cpd, fp_matrix,
+                ode_fn, time_grid, cfg_scale):
+    """Compute global and per-compound FID using torchmetrics.
+
+    Uses EvalDataset: deterministic iteration over all treated test images,
+    deterministic same-plate ctrl pairing, no augmentation.
+    Matches NCA-GAN evaluation protocol.
+    """
     global _global_fid, _cpd_fid
     if not FID_AVAILABLE:
+        print("[warn] torchmetrics not available, skipping FID")
         return None, None
 
     try:
@@ -325,7 +332,7 @@ def compute_fid(model, dataset, device, args, id2cpd, fp_matrix,
             _cpd_fid = FrechetInceptionDistance(normalize=True).to(device)
 
         loader = DataLoader(
-            dataset, batch_size=args.batch_size, shuffle=True,
+            eval_dataset, batch_size=args.batch_size, shuffle=False,
             num_workers=0, pin_memory=False, drop_last=False,
         )
 
@@ -334,11 +341,7 @@ def compute_fid(model, dataset, device, args, id2cpd, fp_matrix,
         per_cpd_fake = defaultdict(list)
 
         model.eval()
-        n_collected = 0
         for img_ctrl, img_trt, cpd_id in loader:
-            if n_collected >= num_samples:
-                break
-
             img_ctrl = img_ctrl.to(device)
             img_trt = img_trt.to(device)
             cpd_id = cpd_id.to(device)
@@ -353,8 +356,11 @@ def compute_fid(model, dataset, device, args, id2cpd, fp_matrix,
             fake = ode_fn(model, x_0, time_grid.to(device), cond=cond, cfg_scale=cfg_scale)
             fake_rgb = fake[:, :3].contiguous()
 
+            # [-1, 1] -> [0, 1], quantize to uint8 like CellFlux eval
             real_01 = (img_trt.clamp(-1, 1) + 1) / 2
+            real_01 = torch.floor(real_01 * 255).float() / 255.0
             fake_01 = (fake_rgb.clamp(-1, 1) + 1) / 2
+            fake_01 = torch.floor(fake_01 * 255).float() / 255.0
 
             _global_fid.update(real_01, real=True)
             _global_fid.update(fake_01, real=False)
@@ -363,8 +369,6 @@ def compute_fid(model, dataset, device, args, id2cpd, fp_matrix,
                 cid = cpd_id[i].item()
                 per_cpd_real[cid].append(real_01[i].cpu())
                 per_cpd_fake[cid].append(fake_01[i].cpu())
-
-            n_collected += img_ctrl.shape[0]
 
         fid_global = _global_fid.compute().item()
 
@@ -452,10 +456,8 @@ def make_parser():
     p.add_argument("--save_every", type=int, default=5000)
     p.add_argument("--vis_every", type=int, default=1000)
     p.add_argument("--log_every", type=int, default=5)
-    p.add_argument("--fid_every", type=int, default=0)
-    p.add_argument("--fid_samples", type=int, default=5000)
-    p.add_argument("--val_fid", action="store_true",
-                   help="Compute FID on test split (validation) for model selection")
+    p.add_argument("--fid_every", type=int, default=0,
+                   help="Compute FID every N steps (0 = disabled, uses all test treated images)")
     p.add_argument("--checkpoint_dir", type=str, default="checkpoints")
     p.add_argument("--resume", type=str, default=None)
     p.add_argument("--device", type=str, default=None)
@@ -537,19 +539,16 @@ def train(args):
     fp_dim = fp_matrix.shape[1]
     print(f"Loaded fingerprints: {fp_matrix.shape} from {args.fp_path}")
 
-    # ---- validation dataset (optional) ----
-    val_dataset = None
-    if args.val_fid and args.fid_every > 0:
-        val_dataset = IMPADataset(
+    # ---- eval dataset for FID (deterministic, no augmentation, test split) ----
+    eval_dataset = None
+    if args.fid_every > 0:
+        eval_dataset = EvalDataset(
             metadata_csv=args.metadata_csv,
             image_dir=args.image_dir,
             split="test",
             image_size=args.image_size,
-            plate_match=args.plate_match,
-            balanced_cpd=args.balanced_cpd,
         )
-        print(f"Validation dataset: {len(val_dataset)} control images, "
-              f"{len(val_dataset.trt_keys)} treated")
+        print(f"FID eval dataset: {len(eval_dataset)} treated test images")
 
     loader = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=True,
@@ -609,7 +608,6 @@ def train(args):
         print(f"Resuming from step {start_step}")
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
-    best_val_fid = float("inf")
 
     # ---- wandb init ----
     if use_wandb:
@@ -718,16 +716,14 @@ def train(args):
             if ema is not None:
                 ema.restore()
 
-        # ---- FID ----
-        if args.fid_every > 0 and (step + 1) % args.fid_every == 0:
+        # ---- FID (test split) ----
+        if args.fid_every > 0 and (step + 1) % args.fid_every == 0 and eval_dataset is not None:
             if ema is not None:
                 ema.apply_shadow()
 
-            # Train FID
             fid_global, fid_per_cpd = compute_fid(
-                model, dataset, device, args, id2cpd, fp_matrix,
+                model, eval_dataset, device, args, id2cpd, fp_matrix,
                 ode_fn, time_grid, args.cfg_scale,
-                num_samples=args.fid_samples,
             )
             if fid_global is not None:
                 fid_log = {"fid/global": fid_global}
@@ -741,51 +737,6 @@ def train(args):
                 if use_wandb:
                     wandb.log(fid_log, step=step + 1)
                 logs["fid/global"].append(fid_global)
-
-            # Validation FID (optional)
-            if val_dataset is not None:
-                val_fid_global, val_fid_per_cpd = compute_fid(
-                    model, val_dataset, device, args, id2cpd, fp_matrix,
-                    ode_fn, time_grid, args.cfg_scale,
-                    num_samples=args.fid_samples,
-                )
-                if val_fid_global is not None:
-                    val_fid_log = {"val_fid/global": val_fid_global}
-                    val_fid_vals = []
-                    for cpd_name, fid_val in val_fid_per_cpd.items():
-                        val_fid_log[f"val_fid/cpd/{cpd_name}"] = fid_val
-                        val_fid_vals.append(fid_val)
-                    if val_fid_vals:
-                        val_fid_log["val_fid/mean_per_cpd"] = np.mean(val_fid_vals)
-                    print(f"[Val FID] global={val_fid_global:.2f}  mean_per_cpd={np.mean(val_fid_vals):.2f}")
-                    if use_wandb:
-                        wandb.log(val_fid_log, step=step + 1)
-                    logs["val_fid/global"].append(val_fid_global)
-
-                    # Save best model based on validation FID
-                    if val_fid_global < best_val_fid:
-                        best_val_fid = val_fid_global
-                        best_path = os.path.join(args.checkpoint_dir, "best_val_fid.pt")
-                        save_checkpoint(
-                            best_path, step=step + 1, model=model, optimizer=optimizer,
-                            logs=logs, ema=ema,
-                            extra={
-                                "model_channels": args.model_channels,
-                                "channel_mult": args.channel_mult,
-                                "num_res_blocks": args.num_res_blocks,
-                                "attention_resolutions": args.attention_resolutions,
-                                "condition_dim": fp_dim,
-                                "noise_level": args.noise_level,
-                                "cfg_scale": args.cfg_scale,
-                                "ode_method": args.ode_method,
-                                "ode_nfe": args.ode_nfe,
-                                "num_compounds": num_compounds,
-                                "image_size": args.image_size,
-                                "wandb_run_id": wandb.run.id if use_wandb else None,
-                                "val_fid": val_fid_global,
-                            },
-                        )
-                        print(f"[best] New best val FID: {val_fid_global:.2f}")
 
             if ema is not None:
                 ema.restore()

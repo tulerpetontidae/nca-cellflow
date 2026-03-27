@@ -58,13 +58,17 @@ class BaseNCA(nn.Module):
     """
     Conditional NCA with FiLM-based compound conditioning.
 
-    compound_id -> Embedding(num_classes, cond_dim) -> FiLM(gamma, beta) -> modulate hidden
+    Supports two conditioning modes:
+    - 'id': compound_id (int) -> Embedding -> FiLM
+    - 'fingerprint': fingerprint vector (float) -> Linear -> FiLM
 
     Args:
         channel_n: Number of state channels
         hidden_dim: Hidden dimension in update MLP
-        num_classes: Number of compound classes
+        num_classes: Number of compound classes (used when cond_type='id')
         cond_dim: Dimension of compound embedding
+        cond_type: 'id' for learned embedding, 'fingerprint' for projected fingerprint
+        fp_dim: Fingerprint vector dimension (used when cond_type='fingerprint')
         fire_rate: Probability of cell update (stochastic masking)
     """
 
@@ -74,18 +78,28 @@ class BaseNCA(nn.Module):
         hidden_dim: int = 128,
         num_classes: int = 1,
         cond_dim: int = 64,
+        cond_type: str = "id",
+        fp_dim: int = 1024,
         fire_rate: float = 1.0,
         step_size: float = 0.1,
+        use_alive_mask: bool = False,
+        alive_threshold: float = 0.05,
     ):
         super().__init__()
         self.channel_n = channel_n
         self.hidden_dim = hidden_dim
         self.fire_rate = fire_rate
         self.step_size = step_size
+        self.use_alive_mask = use_alive_mask
+        self.alive_threshold = alive_threshold
+        self.cond_type = cond_type
         self.sensor = GradientSensor(channel_n)
 
-        # Compound embedding: id -> vector
-        self.embed = nn.Embedding(num_classes, cond_dim)
+        # Compound conditioning
+        if cond_type == "fingerprint":
+            self.embed = nn.Linear(fp_dim, cond_dim)
+        else:
+            self.embed = nn.Embedding(num_classes, cond_dim)
 
         # FiLM: embedding -> (gamma, beta) for each hidden layer
         self.film1 = nn.Linear(cond_dim, hidden_dim * 2)
@@ -140,13 +154,31 @@ class BaseNCA(nn.Module):
             mask = (torch.rand(B, 1, H, W, device=x.device) < self.fire_rate).float()
             dx = dx * mask
 
-        return x + dx * self.step_size
+        new_x = x + dx * self.step_size
+
+        # Alive mask: dead cells get RGB=-1 (black), alive+hidden=0
+        if self.use_alive_mask:
+            alive = F.max_pool2d(x[:, 3:4], 3, stride=1, padding=1) > self.alive_threshold
+            bg = torch.zeros_like(new_x)
+            bg[:, :3] = -1.0
+            new_x = torch.where(alive, new_x, bg)
+
+        return new_x
 
     def forward(self, x, cond, n_steps: int = 1):
         """Apply n_steps NCA updates."""
         for _ in range(n_steps):
             x = self.step(x, cond)
         return x
+
+    def forward_with_intermediate(self, x, cond, n_steps: int, t_intermediate: int):
+        """Forward pass returning both final state and state at step t_intermediate."""
+        intermediate = None
+        for t in range(n_steps):
+            x = self.step(x, cond)
+            if t == t_intermediate:
+                intermediate = x
+        return x, intermediate
 
     def sample(self, x, cond, n_steps: int = 100, output_steps=None):
         """
@@ -187,8 +219,10 @@ class NoiseNCA(nn.Module):
         channel_n: Number of state channels
         noise_channels: Number of noise channels to inject per step
         hidden_dim: Hidden dimension in update MLP
-        num_classes: Number of compound classes
+        num_classes: Number of compound classes (used when cond_type='id')
         cond_dim: Dimension of compound embedding
+        cond_type: 'id' for learned embedding, 'fingerprint' for projected fingerprint
+        fp_dim: Fingerprint vector dimension (used when cond_type='fingerprint')
         fire_rate: Probability of cell update (stochastic masking)
     """
 
@@ -199,8 +233,12 @@ class NoiseNCA(nn.Module):
         hidden_dim: int = 128,
         num_classes: int = 1,
         cond_dim: int = 64,
+        cond_type: str = "id",
+        fp_dim: int = 1024,
         fire_rate: float = 1.0,
         step_size: float = 0.1,
+        use_alive_mask: bool = False,
+        alive_threshold: float = 0.05,
     ):
         super().__init__()
         self.channel_n = channel_n
@@ -208,10 +246,16 @@ class NoiseNCA(nn.Module):
         self.hidden_dim = hidden_dim
         self.fire_rate = fire_rate
         self.step_size = step_size
+        self.use_alive_mask = use_alive_mask
+        self.alive_threshold = alive_threshold
+        self.cond_type = cond_type
 
         self.sensor = GradientSensor(channel_n)
 
-        self.embed = nn.Embedding(num_classes, cond_dim)
+        if cond_type == "fingerprint":
+            self.embed = nn.Linear(fp_dim, cond_dim)
+        else:
+            self.embed = nn.Embedding(num_classes, cond_dim)
         self.film1 = nn.Linear(cond_dim, hidden_dim * 2)
         self.film2 = nn.Linear(cond_dim, hidden_dim * 2)
 
@@ -257,12 +301,31 @@ class NoiseNCA(nn.Module):
             mask = (torch.rand(B, 1, H, W, device=x.device) < self.fire_rate).float()
             dx = dx * mask
 
-        return x + dx * self.step_size
+        new_x = x + dx * self.step_size
+
+        # Alive mask: zero out cells with no alive neighbors
+        # Alive mask: dead cells get RGB=-1 (black), alive+hidden=0
+        if self.use_alive_mask:
+            alive = F.max_pool2d(x[:, 3:4], 3, stride=1, padding=1) > self.alive_threshold
+            bg = torch.zeros_like(new_x)
+            bg[:, :3] = -1.0
+            new_x = torch.where(alive, new_x, bg)
+
+        return new_x
 
     def forward(self, x, cond, n_steps: int = 1):
         for _ in range(n_steps):
             x = self.step(x, cond)
         return x
+
+    def forward_with_intermediate(self, x, cond, n_steps: int, t_intermediate: int):
+        """Forward pass returning both final state and state at step t_intermediate."""
+        intermediate = None
+        for t in range(n_steps):
+            x = self.step(x, cond)
+            if t == t_intermediate:
+                intermediate = x
+        return x, intermediate
 
     def sample(self, x, cond, n_steps: int = 100, output_steps=None):
         samples = []

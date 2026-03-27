@@ -253,6 +253,110 @@ class DiscriminatorStage(nn.Module):
         return x
 
 
+class PatchDiscriminator(nn.Module):
+    """
+    Hybrid patch + global discriminator.
+
+    Shares a backbone, then branches into two heads:
+    - **Patch head**: 1x1 conv → spatial score map [B, H', W'] for local spatial signal
+    - **Global head**: adaptive pool → linear → scalar [B] with class-conditioned
+      embedding dot-product for strong compound-level signal
+
+    The forward method returns a dict with 'patch' and 'global' keys so the
+    training loop can combine them (e.g. average the two losses).
+
+    For 48x48 input with 3 downsampling stages the patch output is ~6x6 = 36 patches.
+
+    Args:
+        widths: Channel counts for each stage
+        cardinalities: Group counts for each stage
+        blocks_per_stage: Number of residual blocks per stage
+        expansion: Channel expansion factor in residual blocks
+        num_classes: Number of classes for conditional discrimination (None for unconditional)
+        embed_dim: Embedding dimension for class conditioning
+        kernel_size: Convolution kernel size
+        resample_filter: Filter for interpolative resampling
+        in_channels: Number of input channels
+    """
+
+    def __init__(
+        self,
+        widths: list[int],
+        cardinalities: list[int],
+        blocks_per_stage: list[int],
+        expansion: int,
+        num_classes: int | None = None,
+        embed_dim: int = 0,
+        kernel_size: int = 3,
+        resample_filter: list[int] = [1, 2, 1],
+        in_channels: int = 2,
+    ) -> None:
+        super().__init__()
+        assert len(widths) >= 1
+        assert len(widths) == len(cardinalities) == len(blocks_per_stage)
+
+        variance_scale_param = sum(blocks_per_stage)
+
+        main_layers: list[nn.Module] = []
+        self.from_rgb = Conv2d(in_channels, widths[0], kernel_size=1)
+
+        # All downsampling stages (no final basis stage)
+        for idx in range(len(widths) - 1):
+            main_layers.append(
+                DiscriminatorStage(
+                    widths[idx],
+                    widths[idx + 1],
+                    cardinalities[idx],
+                    blocks_per_stage[idx],
+                    expansion,
+                    kernel_size,
+                    variance_scale_param,
+                    resample_filter,
+                )
+            )
+        # Final residual blocks without downsampling or basis
+        final_blocks = [
+            ResidualBlock(widths[-1], cardinalities[-1], expansion, kernel_size, variance_scale_param)
+            for _ in range(blocks_per_stage[-1])
+        ]
+        main_layers.append(nn.Sequential(*final_blocks))
+        self.main = nn.ModuleList(main_layers)
+
+        self.use_class_cond = num_classes is not None and embed_dim > 0
+
+        # Patch head: 1x1 conv → spatial score map (unconditional per-patch)
+        self.to_patch_score = Conv2d(widths[-1], 1, kernel_size=1)
+
+        # Global head: adaptive pool → class-conditioned scalar
+        self.adaptive_pool = nn.AdaptiveAvgPool2d(1)
+        if self.use_class_cond:
+            self.global_proj = msr_init(nn.Linear(widths[-1], embed_dim, bias=False))
+            self.embed = nn.Embedding(num_classes, embed_dim)
+        else:
+            self.global_proj = msr_init(nn.Linear(widths[-1], 1, bias=False))
+            self.embed = None
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
+        x = self.from_rgb(x)
+        for layer in self.main:
+            x = layer(x)
+        # x: [B, C_last, H', W']
+
+        # Patch scores (unconditional spatial signal)
+        patch_score = self.to_patch_score(x).squeeze(1)  # [B, H', W']
+
+        # Global score (class-conditioned)
+        g = self.adaptive_pool(x).reshape(x.shape[0], -1)  # [B, C_last]
+        g = self.global_proj(g)  # [B, embed_dim] or [B, 1]
+        if self.use_class_cond and y is not None:
+            e = self.embed(y)  # [B, embed_dim]
+            global_score = torch.sum(g * e, dim=1)  # [B]
+        else:
+            global_score = g.reshape(-1)  # [B]
+
+        return {"patch": patch_score, "global": global_score}
+
+
 class Discriminator(nn.Module):
     """
     Multi-scale residual discriminator with conditional discrimination.
