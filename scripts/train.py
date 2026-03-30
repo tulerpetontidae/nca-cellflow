@@ -35,7 +35,7 @@ except ImportError:
     print("[warn] torchmetrics not installed — FID evaluation disabled")
 
 from nca_cellflow import IMPADataset, EvalDataset
-from nca_cellflow.models import BaseNCA, NoiseNCA, Discriminator, PatchDiscriminator
+from nca_cellflow.models import BaseNCA, NoiseNCA, LatentNCA, NCAStyleEncoder, Discriminator, PatchDiscriminator
 
 
 # ---------------------------------------------------------------------------
@@ -409,6 +409,110 @@ def compute_fid(G, eval_dataset, device, args, id2cpd, img_channels, cond_fn=lam
         return None, None
 
 
+_traj_fid = None
+
+
+def compute_fid_trajectory(G, eval_dataset, device, args, img_channels, cond_fn=lambda x: x):
+    """Compute FID at sampled NCA steps against all real cells (ctrl + trt).
+
+    Memory-efficient: only stores one step's worth of fakes at a time.
+    Samples ~6 evenly-spaced steps to avoid storing all 30 trajectories.
+
+    Returns dict {step: fid_value} or None on failure.
+    """
+    global _traj_fid
+    if not FID_AVAILABLE:
+        return None
+
+    try:
+        if _traj_fid is None:
+            _traj_fid = FrechetInceptionDistance(normalize=True).to(device)
+
+        # Sample ~6 evenly-spaced steps (always include first and last)
+        T = args.nca_steps
+        if T <= 6:
+            eval_steps = list(range(1, T + 1))
+        else:
+            step_size = max(1, T // 5)
+            eval_steps = list(range(step_size, T, step_size))
+            if T not in eval_steps:
+                eval_steps.append(T)
+            if 1 not in eval_steps:
+                eval_steps.insert(0, 1)
+
+        # Use smaller batch size to reduce peak memory
+        traj_bs = min(args.batch_size, 64)
+        loader = DataLoader(
+            eval_dataset, batch_size=traj_bs, shuffle=False,
+            num_workers=0, pin_memory=False, drop_last=False,
+        )
+
+        G.eval()
+
+        # Step 1: compute real stats once, feeding directly to FID (no storage)
+        _traj_fid.reset()
+        for img_ctrl, img_trt, cpd_id in loader:
+            for img in [img_ctrl, img_trt]:
+                img_01 = (img.clamp(-1, 1) + 1) / 2
+                img_01 = torch.floor(img_01 * 255).float() / 255.0
+                _traj_fid.update(img_01.to(device), real=True)
+        real_mu = _traj_fid.real_features_sum.clone()
+        real_cov = _traj_fid.real_features_cov_sum.clone()
+        real_n = _traj_fid.real_features_num_samples.clone()
+        torch.cuda.empty_cache()
+
+        # Step 2: for each eval step, generate fakes and compute FID
+        fid_traj = {}
+        for t_eval in eval_steps:
+            _traj_fid.reset()
+            _traj_fid.real_features_sum.copy_(real_mu)
+            _traj_fid.real_features_cov_sum.copy_(real_cov)
+            _traj_fid.real_features_num_samples.copy_(real_n)
+
+            for img_ctrl, img_trt, cpd_id in loader:
+                img_ctrl = img_ctrl.to(device)
+                cpd_id = cpd_id.to(device)
+
+                # Build NCA input
+                if args.use_alive_mask:
+                    ctrl_01 = (img_ctrl + 1) / 2
+                    alive_ctrl = (ctrl_01.max(dim=1, keepdim=True).values > args.alive_threshold).float()
+                    img_ctrl_full = torch.cat([img_ctrl, alive_ctrl], dim=1)
+                else:
+                    img_ctrl_full = img_ctrl
+                if args.hidden_channels > 0:
+                    pad = torch.zeros(
+                        img_ctrl_full.shape[0], args.hidden_channels,
+                        img_ctrl_full.shape[2], img_ctrl_full.shape[3], device=device,
+                    )
+                    nca_input = torch.cat([img_ctrl_full, pad], dim=1)
+                else:
+                    nca_input = img_ctrl_full
+
+                with torch.no_grad():
+                    cond = cond_fn(cpd_id)
+                    out = G(nca_input, cond, n_steps=t_eval)
+                    rgb = out[:, :3].clamp(-1, 1)
+                    rgb_01 = (rgb + 1) / 2
+                    rgb_01 = torch.floor(rgb_01 * 255).float() / 255.0
+                    _traj_fid.update(rgb_01, real=False)
+
+            try:
+                fid_traj[t_eval] = _traj_fid.compute().item()
+            except Exception:
+                pass
+            torch.cuda.empty_cache()
+
+        G.train()
+        return fid_traj
+
+    except Exception as e:
+        print(f"[warn] FID trajectory failed: {e}")
+        G.train()
+        torch.cuda.empty_cache()
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -430,8 +534,8 @@ def make_parser() -> argparse.ArgumentParser:
 
     # model
     p.add_argument("--nca_type", type=str, default="base",
-                   choices=["base", "noise"],
-                   help="NCA variant: 'base' or 'noise' (with noise injection)")
+                   choices=["base", "noise", "latent"],
+                   help="NCA variant: 'base', 'noise' (per-step noise), or 'latent' (single z via FiLM)")
     p.add_argument("--nca_hidden_dim", type=int, default=128)
     p.add_argument("--nca_cond_dim", type=int, default=64)
     p.add_argument("--cond_type", type=str, default="id", choices=["id", "fingerprint"],
@@ -442,6 +546,8 @@ def make_parser() -> argparse.ArgumentParser:
                    help="Extra hidden channels for NCA state (0 = RGB only)")
     p.add_argument("--noise_channels", type=int, default=1,
                    help="Number of noise channels for NoiseNCA")
+    p.add_argument("--z_dim", type=int, default=16,
+                   help="Latent noise dimension for LatentNCA")
     p.add_argument("--fire_rate", type=float, default=1.0)
     p.add_argument("--use_alive_mask", action="store_true",
                    help="Add alive/dead channel (index 3) to prevent generation in empty space")
@@ -478,6 +584,12 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--intermediate_weight", type=float, default=0.0,
                    help="Weight for intermediate step regularization (0 = disabled). "
                         "Adds a null class to D and supervises random intermediate NCA states.")
+    p.add_argument("--gradual_weight", type=float, default=0.0,
+                   help="Weight for gradual intermediate conditioning (0 = disabled). "
+                        "At NCA step t, G loss = alpha*target + (1-alpha)*null, alpha=(t+1)/T.")
+    p.add_argument("--style_weight", type=float, default=0.0,
+                   help="Weight for style reconstruction loss (LatentNCA only, 0 = disabled). "
+                        "Trains a StyleEncoder to recover the style from the generated image.")
     p.add_argument("--accumulate_steps", type=int, default=1,
                    help="Gradient accumulation steps (effective batch = batch_size * accumulate_steps)")
     p.add_argument("--ema_decay", type=float, default=0.0,
@@ -496,6 +608,8 @@ def make_parser() -> argparse.ArgumentParser:
                         "Measures ||dL/dx_t|| at each NCA step to diagnose gradient attenuation.")
     p.add_argument("--fid_every", type=int, default=0,
                    help="Compute FID every N steps (0 = disabled, uses all test treated images)")
+    p.add_argument("--fid_trajectory_every", type=int, default=0,
+                   help="Compute per-step FID trajectory every N steps (0 = disabled)")
     p.add_argument("--checkpoint_dir", type=str, default="checkpoints")
     p.add_argument("--resume", type=str, default=None,
                    help="Path to checkpoint to resume from")
@@ -633,6 +747,8 @@ def train(args):
     )
     if args.nca_type == "noise":
         G = NoiseNCA(noise_channels=args.noise_channels, **nca_kwargs).to(device)
+    elif args.nca_type == "latent":
+        G = LatentNCA(z_dim=args.z_dim, **nca_kwargs).to(device)
     else:
         G = BaseNCA(**nca_kwargs).to(device)
 
@@ -657,9 +773,11 @@ def train(args):
     if args.compile:
         G = torch.compile(G)
 
-    # Discriminator: extra null class when intermediate regularization is on
+    # Discriminator: extra null class when intermediate or gradual regularization is on
     use_intermediate = args.intermediate_weight > 0
-    d_num_classes = num_compounds + 1 if use_intermediate else num_compounds
+    use_gradual = args.gradual_weight > 0
+    needs_null_class = use_intermediate or use_gradual
+    d_num_classes = num_compounds + 1 if needs_null_class else num_compounds
     null_class_id = num_compounds  # index of the null/cell class
 
     d_widths = [args.d_base_channels] * (args.d_stages + 1)
@@ -678,18 +796,32 @@ def train(args):
         in_channels=img_channels,
     ).to(device)
 
+    # ---- StyleEncoder (for LatentNCA style reconstruction) ----
+    use_style = args.style_weight > 0 and args.nca_type == "latent"
+    S = None
+    if use_style:
+        S = NCAStyleEncoder(
+            in_channels=img_channels, style_dim=args.nca_cond_dim + args.z_dim,
+            base_channels=64,
+        ).to(device)
+
     g_total, g_train = count_parameters(G)
     d_total, d_train = count_parameters(D)
     print(f"Generator  params: total={g_total:,}  trainable={g_train:,}")
     print(f"Discriminator params: total={d_total:,}  trainable={d_train:,}")
+    if S is not None:
+        s_total, s_train = count_parameters(S)
+        print(f"StyleEncoder params: total={s_total:,}  trainable={s_train:,}")
 
     # ---- optimizers ----
     adam_kwargs = dict(betas=(args.beta1, args.beta2), eps=1e-8)
+    # G optimizer includes StyleEncoder params when style loss is on
+    g_params = list(G.parameters()) + (list(S.parameters()) if S is not None else [])
     try:
-        G_opt = torch.optim.Adam(G.parameters(), lr=args.lr_g, fused=True, **adam_kwargs)
+        G_opt = torch.optim.Adam(g_params, lr=args.lr_g, fused=True, **adam_kwargs)
         D_opt = torch.optim.Adam(D.parameters(), lr=args.lr_d, fused=True, **adam_kwargs)
     except Exception:
-        G_opt = torch.optim.Adam(G.parameters(), lr=args.lr_g, **adam_kwargs)
+        G_opt = torch.optim.Adam(g_params, lr=args.lr_g, **adam_kwargs)
         D_opt = torch.optim.Adam(D.parameters(), lr=args.lr_d, **adam_kwargs)
 
     # ---- AMP ----
@@ -704,6 +836,8 @@ def train(args):
         start_step, logs, extra = load_checkpoint(
             args.resume, G, D, G_opt, D_opt, G_ema=G_ema, map_location=device
         )
+        if S is not None and extra and extra.get("S_state"):
+            S.load_state_dict(extra["S_state"])
         print(f"Resuming from step {start_step}")
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
@@ -786,10 +920,11 @@ def train(args):
 
         for nca_input, img_trt, cpd_id in shared_batches:
             with torch.no_grad():
-                if use_intermediate:
-                    t_inter = torch.randint(0, args.nca_steps, (1,)).item()
+                if use_intermediate or use_gradual:
+                    # Sample intermediate step: [0, T-2] to avoid endpoint
+                    t_inter_d = torch.randint(0, args.nca_steps - 1, (1,)).item()
                     fake_full, inter_full = G.forward_with_intermediate(
-                        nca_input, cond_fn(cpd_id), n_steps=args.nca_steps, t_intermediate=t_inter,
+                        nca_input, cond_fn(cpd_id), n_steps=args.nca_steps, t_intermediate=t_inter_d,
                     )
                     inter_img = inter_full[:, :img_channels].contiguous()
                 else:
@@ -812,14 +947,12 @@ def train(args):
             d_loss = (adv_d + reg) / accum
             d_loss.backward()
 
-            # --- Intermediate step regularization (null class) ---
-            if use_intermediate:
-                # Real pool: all cell images (ctrl + trt)
+            # --- Null class D on actual intermediate (for intermediate and/or gradual) ---
+            if use_intermediate or use_gradual:
                 real_null = torch.cat([nca_input[:, :img_channels], img_trt], dim=0)
                 null_ids = torch.full(
                     (real_null.shape[0],), null_class_id, device=device, dtype=torch.long,
                 )
-                # Match intermediate batch to real_null by repeating
                 inter_dup = inter_img.repeat(2, 1, 1, 1)
                 inter_null_ids = torch.full(
                     (inter_dup.shape[0],), null_class_id, device=device, dtype=torch.long,
@@ -837,7 +970,8 @@ def train(args):
                 gp_inter = multi_scale_gp(inter_req.float(), _to_float(d_inter))
                 reg_inter = 0.5 * args.gamma * (gp_real_null.mean() + gp_inter.mean())
 
-                d_inter_loss = args.intermediate_weight * (adv_inter + reg_inter) / accum
+                d_inter_weight = args.intermediate_weight if use_intermediate else args.gradual_weight
+                d_inter_loss = d_inter_weight * (adv_inter + reg_inter) / accum
                 d_inter_loss.backward()
                 accum_d_inter += d_inter_loss.item()
 
@@ -859,17 +993,29 @@ def train(args):
         accum_g_loss = 0.0
         accum_div_loss = 0.0
         accum_g_inter = 0.0
+        accum_g_gradual = 0.0
+        accum_style_loss = 0.0
 
         for nca_input, img_trt, cpd_id in shared_batches:
+            # Pre-compute style + z for LatentNCA (so we can pass z and get style for loss)
+            style_target = None
+            z_sample = None
+            if use_style:
+                style_target, z_sample = G._prepare_cond(cond_fn(cpd_id))
+
+            # Extra kwargs for LatentNCA (pass z to reuse same sample)
+            z_kwargs = {"z": z_sample} if z_sample is not None else {}
+
             with autocast():
-                if use_intermediate:
-                    t_inter = torch.randint(0, args.nca_steps, (1,)).item()
-                    fake_full, inter_full = G.forward_with_intermediate(
-                        nca_input, cond_fn(cpd_id), n_steps=args.nca_steps, t_intermediate=t_inter,
+                if use_intermediate or use_gradual:
+                    t_inter_g = torch.randint(0, args.nca_steps - 1, (1,)).item()
+                    fake_full, inter_full_g = G.forward_with_intermediate(
+                        nca_input, cond_fn(cpd_id), n_steps=args.nca_steps, t_intermediate=t_inter_g,
+                        **z_kwargs,
                     )
-                    inter_img = inter_full[:, :img_channels].contiguous()
+                    inter_img = inter_full_g[:, :img_channels].contiguous()
                 else:
-                    fake_full = G(nca_input, cond_fn(cpd_id), n_steps=args.nca_steps)
+                    fake_full = G(nca_input, cond_fn(cpd_id), n_steps=args.nca_steps, **z_kwargs)
                 fake_img = fake_full[:, :img_channels].contiguous()
 
                 d_real = D(img_trt.detach(), cpd_id)
@@ -912,25 +1058,70 @@ def train(args):
                 g_inter_loss = args.intermediate_weight * g_inter_adv / accum
                 g_inter_loss_val = g_inter_loss.item()
 
+            # --- Gradual intermediate G loss (weighted target + null) ---
+            g_gradual_loss_val = 0.0
+            g_gradual_loss = 0.0
+            if use_gradual:
+                # alpha = (t+1)/T: step 0 in loop = 1st NCA step → alpha=1/T
+                alpha = (t_inter_g + 1) / args.nca_steps
+
+                # Target class: intermediate vs trt
+                # Null class: intermediate vs all cells (ctrl + trt)
+                real_all = torch.cat([nca_input[:, :img_channels], img_trt], dim=0)
+                null_ids = torch.full(
+                    (real_all.shape[0],), null_class_id, device=device, dtype=torch.long,
+                )
+                inter_dup = inter_img.repeat(2, 1, 1, 1)
+                null_ids_fake = torch.full(
+                    (inter_dup.shape[0],), null_class_id, device=device, dtype=torch.long,
+                )
+
+                with autocast():
+                    d_real_tgt = D(img_trt.detach(), cpd_id)
+                    d_fake_tgt = D(inter_img, cpd_id)
+                    d_real_null = D(real_all.detach(), null_ids)
+                    d_fake_null = D(inter_dup, null_ids_fake)
+
+                def _rel_g(d_fake, d_real):
+                    if isinstance(d_fake, dict):
+                        loss = 0.0
+                        for key in d_fake:
+                            loss = loss + F.softplus(-(d_fake[key] - d_real[key])).mean()
+                        return loss
+                    return F.softplus(-(d_fake - d_real)).mean()
+
+                g_gradual_adv = alpha * _rel_g(d_fake_tgt, d_real_tgt) \
+                              + (1 - alpha) * _rel_g(d_fake_null, d_real_null)
+                g_gradual_loss = args.gradual_weight * g_gradual_adv / accum
+                g_gradual_loss_val = g_gradual_loss.item()
+
             # --- Diversity loss ---
+            total_loss = g_loss
+            if use_intermediate:
+                total_loss = total_loss + g_inter_loss
+            if use_gradual:
+                total_loss = total_loss + g_gradual_loss
             if args.diversity_weight > 0:
                 with autocast():
                     fake_full2 = G(nca_input, cond_fn(cpd_id), n_steps=args.nca_steps)
                     fake_img2 = fake_full2[:, :img_channels].contiguous()
                 div_loss = -torch.mean(torch.abs(fake_img - fake_img2)) / accum
-                total_loss = g_loss + args.diversity_weight * div_loss
-                if use_intermediate:
-                    total_loss = total_loss + g_inter_loss
-                total_loss.backward()
+                total_loss = total_loss + args.diversity_weight * div_loss
                 accum_div_loss += div_loss.item()
-            elif use_intermediate:
-                total_loss = g_loss + g_inter_loss
-                total_loss.backward()
-            else:
-                g_loss.backward()
+
+            # --- Style reconstruction loss (LatentNCA only) ---
+            if use_style:
+                with autocast():
+                    style_hat = S(fake_img)
+                sty_loss = F.l1_loss(style_hat, style_target.detach()) / accum
+                total_loss = total_loss + args.style_weight * sty_loss
+                accum_style_loss += sty_loss.item()
+
+            total_loss.backward()
 
             accum_g_loss += g_loss.item()
             accum_g_inter += g_inter_loss_val
+            accum_g_gradual += g_gradual_loss_val
 
         nn_utils.clip_grad_norm_(G.parameters(), max_norm=args.grad_clip)
         G_opt.step()
@@ -955,9 +1146,14 @@ def train(args):
                     hook_grads[t_idx] = grad.norm().item()
                 return hook
 
+            # Pre-compute conditioning (handles LatentNCA's embed + z concat)
+            diag_cond = cond_fn(cpd_id_diag)
+            if hasattr(G, '_prepare_cond'):
+                diag_cond, _ = G._prepare_cond(diag_cond)
+
             x_t.register_hook(make_hook(0))
             for t in range(args.nca_steps):
-                x_t = G.step(x_t, cond_fn(cpd_id_diag))
+                x_t = G.step(x_t, diag_cond)
                 if t < args.nca_steps - 1:
                     x_t.register_hook(make_hook(t + 1))
 
@@ -999,9 +1195,14 @@ def train(args):
         }
         if args.diversity_weight > 0:
             log_dict["loss/diversity"] = accum_div_loss
-        if use_intermediate:
+        if use_style:
+            log_dict["loss/style_recon"] = accum_style_loss
+        if use_intermediate or use_gradual:
             log_dict["loss/D_inter"] = accum_d_inter
+        if use_intermediate:
             log_dict["loss/G_inter"] = accum_g_inter
+        if use_gradual:
+            log_dict["loss/G_gradual"] = accum_g_gradual
         for k, v in log_dict.items():
             logs[k].append(v)
 
@@ -1046,6 +1247,18 @@ def train(args):
                     wandb.log(fid_log, step=step + 1)
                 logs["fid/global"].append(fid_global)
 
+        # ============== FID trajectory (per-step FID vs all real cells) ==============
+        if args.fid_trajectory_every > 0 and (step + 1) % args.fid_trajectory_every == 0 and eval_dataset is not None:
+            traj_G = G_ema.module if use_ema else G
+            fid_traj = compute_fid_trajectory(
+                traj_G, eval_dataset, device, args, img_channels, cond_fn=cond_fn,
+            )
+            if fid_traj is not None:
+                traj_log = {f"fid_traj/step_{t}": v for t, v in fid_traj.items()}
+                print(f"[FID traj] " + "  ".join(f"t={t}:{v:.1f}" for t, v in sorted(fid_traj.items())))
+                if use_wandb:
+                    wandb.log(traj_log, step=step + 1)
+
         # ============== Checkpointing ==============
         is_save_step = (step + 1) % args.save_every == 0
         is_last_step = step == args.iterations - 1
@@ -1066,6 +1279,7 @@ def train(args):
                     "nca_steps": args.nca_steps,
                     "hidden_channels": args.hidden_channels,
                     "noise_channels": args.noise_channels,
+                    "z_dim": args.z_dim,
                     "channel_n": channel_n,
                     "num_compounds": num_compounds,
                     "ema_decay": args.ema_decay,
@@ -1078,6 +1292,9 @@ def train(args):
                     "fp_path": args.fp_path,
                     "d_type": args.d_type,
                     "intermediate_weight": args.intermediate_weight,
+                    "gradual_weight": args.gradual_weight,
+                    "style_weight": args.style_weight,
+                    "S_state": S.state_dict() if S is not None else None,
                     "wandb_run_id": wandb.run.id if use_wandb else None,
                 },
             )

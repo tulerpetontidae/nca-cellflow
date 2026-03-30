@@ -356,6 +356,17 @@ class PatchDiscriminator(nn.Module):
 
         return {"patch": patch_score, "global": global_score}
 
+    def forward_with_embed(self, x: torch.Tensor, e: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Forward with pre-computed embedding (for interpolated conditioning)."""
+        x = self.from_rgb(x)
+        for layer in self.main:
+            x = layer(x)
+        patch_score = self.to_patch_score(x).squeeze(1)
+        g = self.adaptive_pool(x).reshape(x.shape[0], -1)
+        g = self.global_proj(g)
+        global_score = torch.sum(g * e, dim=1)
+        return {"patch": patch_score, "global": global_score}
+
 
 class Discriminator(nn.Module):
     """
@@ -444,3 +455,11 @@ class Discriminator(nn.Module):
         else:
             x = x.reshape(-1)
         return x
+
+    def forward_with_embed(self, x: torch.Tensor, e: torch.Tensor) -> torch.Tensor:
+        """Forward with pre-computed embedding (for interpolated conditioning)."""
+        x = self.from_rgb(x)
+        for layer in self.main:
+            x = layer(x)
+        x = x.reshape(x.shape[0], -1)
+        return torch.sum(x * e, dim=1, keepdim=False)

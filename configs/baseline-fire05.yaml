@@ -35,5 +35,6 @@ num_workers: 8
 save_every: 5000
 vis_every: 1000
 fid_every: 1000
+fid_trajectory_every: 5000
 checkpoint_dir: /oak/stanford/groups/ccurtis2/users/alomakin/projects/nca-cellflow/checkpoints/baseline-fire05
 wandb_project: nca-cellflow

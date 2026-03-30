@@ -4,7 +4,7 @@ Models module for NCA-CellFlow.
 Contains generator (NCA), discriminator, and CellFlux UNet implementations.
 """
 
-from .nca import BaseNCA, NoiseNCA, GradientSensor
+from .nca import BaseNCA, NoiseNCA, LatentNCA, NCAStyleEncoder, GradientSensor
 from .discriminator import Discriminator, PatchDiscriminator
 from .cellflux_unet import CellFluxUNet
 from .impa import (
@@ -12,7 +12,7 @@ from .impa import (
 )
 
 __all__ = [
-    "BaseNCA", "NoiseNCA", "GradientSensor",
+    "BaseNCA", "NoiseNCA", "LatentNCA", "NCAStyleEncoder", "GradientSensor",
     "Discriminator", "PatchDiscriminator",
     "CellFluxUNet",
     "IMPAGenerator", "IMPAMappingNetwork", "IMPAStyleEncoder", "IMPADiscriminator",

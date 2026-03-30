@@ -44,6 +44,7 @@ num_workers: 8
 save_every: 5000
 vis_every: 1000
 fid_every: 5000
+fid_trajectory_every: 5000
 grad_diag_every: 1000
 checkpoint_dir: /oak/stanford/groups/ccurtis2/users/alomakin/projects/nca-cellflow/checkpoints/noise-hidden6-ema-steps30-v2-ss001-plate-alive03-lb
 wandb_project: nca-cellflow
