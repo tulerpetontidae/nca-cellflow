@@ -19,12 +19,18 @@ _python = "/omics/groups/OE0606/internal/art1m/micromamba/envs/voidtracer/bin/py
 bsub_template = f"bsub -gpu num=1:j_exclusive=yes:gmem=100G -R 'rusage[mem=32GB]'{_host_select_clause} -q gpu-pro 'cd {_project_dir} && OMP_NUM_THREADS=16 {_wandb_env}{{command}}'"
 
 configs = [
-    # # 1. Baseline — hidden_dim=128
-    # {
-    #     "wandb_name": "petridish-base",
-    #     "config": "configs/petridish-base.yaml",
-    # },
-    # 2. Wider — hidden_dim=256
+    # 1. Baseline — hidden_dim=128
+    {
+        "wandb_name": "petridish-base",
+        "config": "configs/petridish-base.yaml",
+    },
+    # 2. Baseline, lighter style — style_weight=0.5
+    {
+        "wandb_name": "petridish-base-style05",
+        "config": "configs/petridish-base.yaml",
+        "style_weight": 0.5,
+    },
+    # 3. Wider — hidden_dim=256
     {
         "wandb_name": "petridish-w256",
         "config": "configs/petridish-base.yaml",
