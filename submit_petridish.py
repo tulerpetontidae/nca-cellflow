@@ -31,11 +31,11 @@ configs = [
         "style_weight": 0.5,
     },
     # 3. Wider — hidden_dim=256
-    {
-        "wandb_name": "petridish-w256",
-        "config": "configs/petridish-base.yaml",
-        "nca_hidden_dim": 256,
-    },
+    # {
+    #     "wandb_name": "petridish-w256",
+    #     "config": "configs/petridish-base.yaml",
+    #     "nca_hidden_dim": 256,
+    # },
 ]
 
 
