@@ -24,8 +24,9 @@ def main():
     npy_files = sorted(image_dir.glob("**/*.npy"))
     print(f"Found {len(npy_files)} .npy files in {image_dir}")
 
+    from tqdm import tqdm
     data = {}
-    for f in npy_files:
+    for f in tqdm(npy_files, desc="Loading"):
         batch = f.parent.parent.name
         plate = f.parent.name
         sample_key = f"{batch}_{plate}_{f.stem}"
