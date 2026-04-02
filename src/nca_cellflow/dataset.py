@@ -317,20 +317,37 @@ class LabeledImageBank:
         # Preload all images into RAM (uint8 to save memory, augment on the fly)
         self._cache = {}
         if preload:
+            pkl_path = self.image_dir / "images.pkl"
             all_keys = set(ctrl["SAMPLE_KEY"].values) | set(trt["SAMPLE_KEY"].values)
-            print(f"Preloading {len(all_keys)} images into RAM...")
-            for key in all_keys:
-                parts = key.split("_")
-                path = self.image_dir / parts[0] / parts[1] / ("_".join(parts[2:]) + ".npy")
-                img = np.load(path)  # uint8 [H, W, C]
-                if image_size != img.shape[0]:
-                    # Store as float32 after resize
-                    t = torch.from_numpy(img.astype(np.float32)).permute(2, 0, 1)
-                    t = F.interpolate(t.unsqueeze(0), size=image_size,
-                                      mode="bilinear", antialias=True).squeeze(0)
-                    self._cache[key] = t  # float32 [C, H, W] in [0, 255]
-                else:
-                    self._cache[key] = img  # keep as uint8 to save memory
+            if pkl_path.exists():
+                import pickle
+                print(f"Loading prepacked images from {pkl_path}...")
+                with open(pkl_path, "rb") as f:
+                    all_images = pickle.load(f)
+                for key in all_keys:
+                    img = all_images[key]
+                    if image_size != img.shape[0]:
+                        t = torch.from_numpy(img.astype(np.float32)).permute(2, 0, 1)
+                        t = F.interpolate(t.unsqueeze(0), size=image_size,
+                                          mode="bilinear", antialias=True).squeeze(0)
+                        self._cache[key] = t
+                    else:
+                        self._cache[key] = img
+                del all_images
+            else:
+                print(f"Preloading {len(all_keys)} images from disk "
+                      f"(run scripts/prepack_images.py for 20x faster startup)...")
+                for key in all_keys:
+                    parts = key.split("_")
+                    path = self.image_dir / parts[0] / parts[1] / ("_".join(parts[2:]) + ".npy")
+                    img = np.load(path)
+                    if image_size != img.shape[0]:
+                        t = torch.from_numpy(img.astype(np.float32)).permute(2, 0, 1)
+                        t = F.interpolate(t.unsqueeze(0), size=image_size,
+                                          mode="bilinear", antialias=True).squeeze(0)
+                        self._cache[key] = t
+                    else:
+                        self._cache[key] = img
             print(f"Preloaded {len(self._cache)} images.")
 
     def _load_cached(self, key: str, augment: bool = True) -> torch.Tensor:
