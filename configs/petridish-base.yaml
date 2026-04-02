@@ -42,7 +42,7 @@ style_weight: 1.0
 
 # training
 batch_size: 64
-iterations: 40000
+iterations: 120000
 lr_g: 2e-4
 lr_d: 2e-4
 grad_clip: 1.0

@@ -267,7 +267,7 @@ class LabeledImageBank:
     """
 
     def __init__(self, metadata_csv: str, image_dir: str, split: str = "train",
-                 image_size: int = 96):
+                 image_size: int = 96, preload: bool = True):
         df = pd.read_csv(metadata_csv, index_col=0)
         df = df[df["SPLIT"] == split]
 
@@ -314,6 +314,46 @@ class LabeledImageBank:
                 if cpd_id > 0:  # skip DMSO
                     self.available_targets.append((cpd_id, dose))
 
+        # Preload all images into RAM (uint8 to save memory, augment on the fly)
+        self._cache = {}
+        if preload:
+            all_keys = set(ctrl["SAMPLE_KEY"].values) | set(trt["SAMPLE_KEY"].values)
+            print(f"Preloading {len(all_keys)} images into RAM...")
+            for key in all_keys:
+                parts = key.split("_")
+                path = self.image_dir / parts[0] / parts[1] / ("_".join(parts[2:]) + ".npy")
+                img = np.load(path)  # uint8 [H, W, C]
+                if image_size != img.shape[0]:
+                    # Store as float32 after resize
+                    t = torch.from_numpy(img.astype(np.float32)).permute(2, 0, 1)
+                    t = F.interpolate(t.unsqueeze(0), size=image_size,
+                                      mode="bilinear", antialias=True).squeeze(0)
+                    self._cache[key] = t  # float32 [C, H, W] in [0, 255]
+                else:
+                    self._cache[key] = img  # keep as uint8 to save memory
+            print(f"Preloaded {len(self._cache)} images.")
+
+    def _load_cached(self, key: str, augment: bool = True) -> torch.Tensor:
+        """Load image from cache (fast) or disk (fallback)."""
+        if key in self._cache:
+            raw = self._cache[key]
+            if isinstance(raw, np.ndarray):
+                img = torch.from_numpy(raw.astype(np.float32)).permute(2, 0, 1)
+            else:
+                img = raw.clone()  # already float32 [C, H, W]
+            if augment:
+                img = (img + torch.rand_like(img)) / 255.0
+            else:
+                img = (img + 0.5) / 255.0
+            img = img * 2.0 - 1.0
+            if augment:
+                if torch.rand(1).item() < 0.5:
+                    img = img.flip(-1)
+                if torch.rand(1).item() < 0.5:
+                    img = img.flip(-2)
+            return img
+        return _load_image(self.image_dir, key, self.image_size, augment=augment)
+
     def sample_one(self, cpd_id: int, dose: float = 0.0,
                    plate: str | None = None) -> tuple[torch.Tensor, str]:
         """Sample a single image matching (cpd_id, dose), preferring plate.
@@ -326,8 +366,7 @@ class LabeledImageBank:
             keys = self._index.get(cpd_id, {}).get(dose, {}).get(plate, [])
             if keys:
                 key = keys[np.random.randint(len(keys))]
-                img = _load_image(self.image_dir, key, self.image_size, augment=True)
-                return img, plate
+                return self._load_cached(key), plate
 
         # Fallback: any plate
         keys = self._flat_index.get((cpd_id, dose), [])
@@ -337,14 +376,12 @@ class LabeledImageBank:
                 for p, ks in plate_dict.items():
                     if ks:
                         key = ks[np.random.randint(len(ks))]
-                        img = _load_image(self.image_dir, key, self.image_size, augment=True)
-                        return img, p
+                        return self._load_cached(key), p
             raise ValueError(f"No images found for cpd_id={cpd_id}, dose={dose}")
 
         key = keys[np.random.randint(len(keys))]
         actual_plate = _plate_from_key(key)
-        img = _load_image(self.image_dir, key, self.image_size, augment=True)
-        return img, actual_plate
+        return self._load_cached(key), actual_plate
 
     def sample_batch(self, cpd_ids: torch.Tensor, doses: torch.Tensor,
                      plates: list[str | None] | None = None) -> torch.Tensor:
