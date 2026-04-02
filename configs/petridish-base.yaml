@@ -31,13 +31,13 @@ pool_recycle_iter: 4
 
 # transitions
 homeo_weight: 3.0
-homeo_perturb_steps: 3
-z_drift: 0.5
+homeo_perturb_steps: 0
+z_drift: 0.0
 ckpt_window: 10
 
 # losses
 gamma: 1.0
-intermediate_weight: 0.5
+intermediate_weight: 1.0
 style_weight: 1.0
 
 # training

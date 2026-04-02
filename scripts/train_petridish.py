@@ -264,10 +264,10 @@ def make_parser():
 
     # transitions
     p.add_argument("--homeo_weight", type=float, default=3.0)
-    p.add_argument("--homeo_perturb_steps", type=int, default=3,
-                   help="Wrong-label NCA steps on homeostasis states to prevent identity mapping")
-    p.add_argument("--z_drift", type=float, default=0.5,
-                   help="Z drift beta: z_new = sqrt(1-b)*z_old + sqrt(b)*N(0,1)")
+    p.add_argument("--homeo_perturb_steps", type=int, default=0,
+                   help="Wrong-label NCA steps on homeostasis states (0=off, nca-clock default is off)")
+    p.add_argument("--z_drift", type=float, default=0.0,
+                   help="Z drift beta during training (0=off, drift is normally inference-only)")
 
     # checkpoint sampling
     p.add_argument("--ckpt_window", type=int, default=10,
@@ -275,7 +275,7 @@ def make_parser():
 
     # losses
     p.add_argument("--gamma", type=float, default=1.0, help="Gradient penalty weight")
-    p.add_argument("--intermediate_weight", type=float, default=0.5,
+    p.add_argument("--intermediate_weight", type=float, default=1.0,
                    help="Weight for intermediate step regularization")
     p.add_argument("--style_weight", type=float, default=1.0,
                    help="Weight for style reconstruction loss")
@@ -500,14 +500,9 @@ def main():
                     cond_z, _ = G._prepare_cond(wrong_labels, wrong_z, wrong_doses)
                     pool_states[homeo_mask] = G.step(pool_states[homeo_mask], cond_z)
 
-        # ============ 4. Z drift on homeostasis ============
-        if n_homeo > 0 and args.z_drift > 0:
-            beta = args.z_drift
-            homeo_mask = is_homeo.to(device)
-            pool_z[homeo_mask] = (
-                (1 - beta) ** 0.5 * pool_z[homeo_mask] +
-                beta ** 0.5 * torch.randn_like(pool_z[homeo_mask])
-            )
+        # ============ 4. Z: keep fixed per slot (drift is inference-only) ============
+        # z stays fixed for each pool slot — FiLM entanglement + style recon
+        # force the model to use z. Brownian drift applied at eval time only.
 
         # ============ 5. Forward NCA with checkpoint sampling ============
         with torch.no_grad():
