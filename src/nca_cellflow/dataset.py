@@ -18,11 +18,35 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 from pathlib import Path
+from collections import defaultdict
 
 
 def _plate_from_key(key: str) -> str:
     """Extract plate id from SAMPLE_KEY: {BATCH}_{PLATE}_{rest}."""
     return key.split("_")[1]
+
+
+def _load_image(image_dir: Path, key: str, image_size: int = 96,
+                augment: bool = False) -> torch.Tensor:
+    """Load a single .npy image, normalize to [-1, 1]."""
+    parts = key.split("_")
+    path = image_dir / parts[0] / parts[1] / ("_".join(parts[2:]) + ".npy")
+    img = np.load(path).astype(np.float32)
+    img = torch.from_numpy(img).permute(2, 0, 1)
+    if augment:
+        img = (img + torch.rand_like(img)) / 255.0
+    else:
+        img = (img + 0.5) / 255.0
+    if image_size != img.shape[-1]:
+        img = F.interpolate(img.unsqueeze(0), size=image_size,
+                            mode="bilinear", antialias=True).squeeze(0)
+    img = img * 2.0 - 1.0
+    if augment:
+        if torch.rand(1).item() < 0.5:
+            img = img.flip(-1)
+        if torch.rand(1).item() < 0.5:
+            img = img.flip(-2)
+    return img
 
 
 class IMPADataset(Dataset):
@@ -222,12 +246,122 @@ class EvalDataset(Dataset):
         return img_ctrl, img_trt, cpd_id
 
     def _load(self, key: str) -> torch.Tensor:
-        parts = key.split("_")
-        path = self.image_dir / parts[0] / parts[1] / ("_".join(parts[2:]) + ".npy")
-        img = np.load(path).astype(np.float32)
-        img = torch.from_numpy(img).permute(2, 0, 1)
-        img = (img + 0.5) / 255.0                           # center of bin, no noise
-        if self.image_size != img.shape[-1]:
-            img = F.interpolate(img.unsqueeze(0), size=self.image_size, mode="bilinear", antialias=True).squeeze(0)
-        img = img * 2.0 - 1.0                               # [-1, 1]
-        return img
+        return _load_image(self.image_dir, key, self.image_size, augment=False)
+
+
+class LabeledImageBank:
+    """Plate-aware image sampler indexed by (cpd_id, dose) for petri dish training.
+
+    Provides fast random sampling of real images conditioned on compound, dose,
+    and optionally plate. Used by the discriminator to get real targets matching
+    the pool state's current conditioning.
+
+    Label 0 = DMSO (control), labels 1..N = compounds (sorted alphabetically,
+    matching IMPADataset.cpd2id but shifted by +1 to make room for DMSO).
+
+    Args:
+        metadata_csv: Path to bbbc021_df_all.csv.
+        image_dir: Root image directory.
+        split: "train" or "test".
+        image_size: Target spatial size.
+    """
+
+    def __init__(self, metadata_csv: str, image_dir: str, split: str = "train",
+                 image_size: int = 96):
+        df = pd.read_csv(metadata_csv, index_col=0)
+        df = df[df["SPLIT"] == split]
+
+        self.image_dir = Path(image_dir)
+        self.image_size = image_size
+
+        ctrl = df[df["STATE"] == 0]
+        trt = df[df["STATE"] == 1]
+
+        # Compound mapping: 0 = DMSO, 1..N = sorted compound names
+        cpds = sorted(set(trt["CPD_NAME"].values))
+        self.cpd2id = {c: i + 1 for i, c in enumerate(cpds)}
+        self.id2cpd = {i + 1: c for i, c in enumerate(cpds)}
+        self.num_compounds = len(cpds)  # excludes DMSO
+        self.num_classes = len(cpds) + 1  # includes DMSO
+
+        # Index: cpd_id -> dose -> plate -> [sample_keys]
+        # For DMSO (cpd_id=0): dose is always 0.0
+        self._index = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+
+        # Add ctrl images under DMSO
+        for key in ctrl["SAMPLE_KEY"].values:
+            plate = _plate_from_key(key)
+            self._index[0][0.0][plate].append(key)
+
+        # Add trt images under their compound + dose
+        for _, row in trt.iterrows():
+            cpd_id = self.cpd2id[row["CPD_NAME"]]
+            dose = float(row["DOSE"])
+            plate = _plate_from_key(row["SAMPLE_KEY"])
+            self._index[cpd_id][dose][plate].append(row["SAMPLE_KEY"])
+
+        # Build flat index per (cpd_id, dose) for fallback (all plates)
+        self._flat_index = defaultdict(list)
+        for cpd_id, doses in self._index.items():
+            for dose, plates in doses.items():
+                for plate, keys in plates.items():
+                    self._flat_index[(cpd_id, dose)].extend(keys)
+
+        # Available (cpd_id, dose) pairs for transitions
+        self.available_targets = []
+        for cpd_id, doses in self._index.items():
+            for dose in doses:
+                if cpd_id > 0:  # skip DMSO
+                    self.available_targets.append((cpd_id, dose))
+
+    def sample_one(self, cpd_id: int, dose: float = 0.0,
+                   plate: str | None = None) -> tuple[torch.Tensor, str]:
+        """Sample a single image matching (cpd_id, dose), preferring plate.
+
+        Returns:
+            (image_tensor [C, H, W], plate_str)
+        """
+        # Try plate-matched first
+        if plate is not None:
+            keys = self._index.get(cpd_id, {}).get(dose, {}).get(plate, [])
+            if keys:
+                key = keys[np.random.randint(len(keys))]
+                img = _load_image(self.image_dir, key, self.image_size, augment=True)
+                return img, plate
+
+        # Fallback: any plate
+        keys = self._flat_index.get((cpd_id, dose), [])
+        if not keys:
+            # Last resort: any image from this compound (any dose)
+            for d, plate_dict in self._index.get(cpd_id, {}).items():
+                for p, ks in plate_dict.items():
+                    if ks:
+                        key = ks[np.random.randint(len(ks))]
+                        img = _load_image(self.image_dir, key, self.image_size, augment=True)
+                        return img, p
+            raise ValueError(f"No images found for cpd_id={cpd_id}, dose={dose}")
+
+        key = keys[np.random.randint(len(keys))]
+        actual_plate = _plate_from_key(key)
+        img = _load_image(self.image_dir, key, self.image_size, augment=True)
+        return img, actual_plate
+
+    def sample_batch(self, cpd_ids: torch.Tensor, doses: torch.Tensor,
+                     plates: list[str | None] | None = None) -> torch.Tensor:
+        """Sample a batch of real images matching given labels.
+
+        Args:
+            cpd_ids: [B] compound IDs.
+            doses: [B] dose values.
+            plates: Optional list of plate strings for plate-matched sampling.
+
+        Returns:
+            [B, C, H, W] tensor of real images.
+        """
+        B = cpd_ids.shape[0]
+        imgs = []
+        for i in range(B):
+            plate = plates[i] if plates is not None else None
+            img, _ = self.sample_one(cpd_ids[i].item(), doses[i].item(), plate)
+            imgs.append(img)
+        return torch.stack(imgs)

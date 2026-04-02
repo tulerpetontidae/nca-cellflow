@@ -1,0 +1,57 @@
+# Petri Dish NCA — base config
+# Pool-based training with homeostasis + transitions, dose conditioning
+
+# data
+image_size: 48
+plate_match: true
+
+# model (LatentNCA with dose)
+nca_hidden_dim: 128
+nca_cond_dim: 64
+z_dim: 16
+dose_dim: 8
+hidden_channels: 6
+fire_rate: 1.0
+step_size: 0.005
+use_tanh: true
+nca_steps: 60
+
+# discriminator
+d_type: global
+d_stages: 3
+d_base_channels: 32
+d_blocks: 2
+d_cardinality: 4
+d_expansion: 2
+d_embed_dim: 32
+
+# pool
+pool_size: 2048
+pool_recycle_iter: 4
+
+# transitions
+homeo_weight: 3.0
+homeo_perturb_steps: 3
+z_drift: 0.5
+ckpt_window: 10
+
+# losses
+gamma: 1.0
+intermediate_weight: 0.5
+style_weight: 1.0
+
+# training
+batch_size: 64
+iterations: 40000
+lr_g: 2e-4
+lr_d: 2e-4
+grad_clip: 1.0
+ema_decay: 0.999
+ema_warmup_steps: 1000
+
+# logging
+save_every: 2000
+log_every: 5
+vis_every: 500
+wandb: true
+wandb_project: nca-petridish

@@ -83,6 +83,8 @@ class BaseNCA(nn.Module):
         fp_dim: int = 1024,
         fire_rate: float = 1.0,
         step_size: float = 0.1,
+        dx_clip: float = 10.0,
+        use_tanh: bool = False,
         use_alive_mask: bool = False,
         alive_threshold: float = 0.05,
     ):
@@ -91,6 +93,8 @@ class BaseNCA(nn.Module):
         self.hidden_dim = hidden_dim
         self.fire_rate = fire_rate
         self.step_size = step_size
+        self.dx_clip = dx_clip
+        self.use_tanh = use_tanh
         self.use_alive_mask = use_alive_mask
         self.alive_threshold = alive_threshold
         self.cond_type = cond_type
@@ -148,7 +152,10 @@ class BaseNCA(nn.Module):
         h = gamma2 * h + beta2
         dx = self.fc3(h).permute(0, 3, 1, 2)  # [B, C, H, W]
 
-        dx = torch.clamp(dx, min=-10, max=10)
+        if self.use_tanh:
+            dx = torch.tanh(dx)
+        else:
+            dx = torch.clamp(dx, min=-self.dx_clip, max=self.dx_clip)
 
         # Fire rate mask
         if self.fire_rate < 1.0:
@@ -238,6 +245,8 @@ class NoiseNCA(nn.Module):
         fp_dim: int = 1024,
         fire_rate: float = 1.0,
         step_size: float = 0.1,
+        dx_clip: float = 10.0,
+        use_tanh: bool = False,
         use_alive_mask: bool = False,
         alive_threshold: float = 0.05,
     ):
@@ -247,6 +256,8 @@ class NoiseNCA(nn.Module):
         self.hidden_dim = hidden_dim
         self.fire_rate = fire_rate
         self.step_size = step_size
+        self.dx_clip = dx_clip
+        self.use_tanh = use_tanh
         self.use_alive_mask = use_alive_mask
         self.alive_threshold = alive_threshold
         self.cond_type = cond_type
@@ -296,7 +307,10 @@ class NoiseNCA(nn.Module):
         h = gamma2 * h + beta2
         dx = self.fc3(h).permute(0, 3, 1, 2)
 
-        dx = torch.clamp(dx, min=-10, max=10)
+        if self.use_tanh:
+            dx = torch.tanh(dx)
+        else:
+            dx = torch.clamp(dx, min=-self.dx_clip, max=self.dx_clip)
 
         if self.fire_rate < 1.0:
             mask = (torch.rand(B, 1, H, W, device=x.device) < self.fire_rate).float()
@@ -304,7 +318,6 @@ class NoiseNCA(nn.Module):
 
         new_x = x + dx * self.step_size
 
-        # Alive mask: zero out cells with no alive neighbors
         # Alive mask: dead cells get RGB=-1 (black), alive+hidden=0
         if self.use_alive_mask:
             alive = F.max_pool2d(x[:, 3:4], 3, stride=1, padding=1) > self.alive_threshold
@@ -378,16 +391,22 @@ class LatentNCA(nn.Module):
         fp_dim: int = 1024,
         fire_rate: float = 1.0,
         step_size: float = 0.1,
+        dx_clip: float = 10.0,
+        use_tanh: bool = False,
         use_alive_mask: bool = False,
         alive_threshold: float = 0.05,
+        dose_dim: int = 0,
     ):
         super().__init__()
         self.channel_n = channel_n
         self.z_dim = z_dim
         self.hidden_dim = hidden_dim
         self.cond_dim = cond_dim
+        self.dose_dim = dose_dim
         self.fire_rate = fire_rate
         self.step_size = step_size
+        self.dx_clip = dx_clip
+        self.use_tanh = use_tanh
         self.use_alive_mask = use_alive_mask
         self.alive_threshold = alive_threshold
         self.cond_type = cond_type
@@ -400,8 +419,12 @@ class LatentNCA(nn.Module):
         else:
             self.embed = nn.Embedding(num_classes, cond_dim)
 
-        # FiLM directly from [embed || z] -> (gamma, beta)
-        film_in = cond_dim + z_dim
+        # Optional dose conditioning: log10(dose) -> Linear -> dose_dim
+        if dose_dim > 0:
+            self.dose_proj = nn.Linear(1, dose_dim)
+
+        # FiLM directly from [embed || dose || z] -> (gamma, beta)
+        film_in = cond_dim + dose_dim + z_dim
         self.film1 = nn.Linear(film_in, hidden_dim * 2)
         self.film2 = nn.Linear(film_in, hidden_dim * 2)
 
@@ -436,7 +459,10 @@ class LatentNCA(nn.Module):
         h = gamma2 * h + beta2
         dx = self.fc3(h).permute(0, 3, 1, 2)
 
-        dx = torch.clamp(dx, min=-10, max=10)
+        if self.use_tanh:
+            dx = torch.tanh(dx)
+        else:
+            dx = torch.clamp(dx, min=-self.dx_clip, max=self.dx_clip)
 
         if self.fire_rate < 1.0:
             mask = (torch.rand(B, 1, H, W, device=x.device) < self.fire_rate).float()
@@ -452,22 +478,42 @@ class LatentNCA(nn.Module):
 
         return new_x
 
-    def _prepare_cond(self, cond, z=None):
-        """Embed compound, sample z if needed. Returns ([embed || z], z)."""
+    def _prepare_cond(self, cond, z=None, dose=None):
+        """Embed compound, optionally encode dose, sample z if needed.
+
+        Args:
+            cond: Compound IDs [B] or fingerprints [B, fp_dim].
+            z: Optional latent [B, z_dim]. Sampled from N(0,1) if None.
+            dose: Optional dose values [B]. Only used when dose_dim > 0.
+
+        Returns:
+            (cond_z [B, cond_dim + dose_dim + z_dim], z [B, z_dim])
+        """
         emb = self.embed(cond)  # [B, cond_dim]
         if z is None:
             z = torch.randn(emb.shape[0], self.z_dim, device=emb.device)
-        cond_z = torch.cat([emb, z], dim=1)  # [B, cond_dim + z_dim]
+        parts = [emb]
+        if self.dose_dim > 0:
+            if dose is not None:
+                # log10(dose) with safe handling for dose=0 (DMSO)
+                log_dose = torch.log10(dose.clamp(min=1e-4)).unsqueeze(-1)  # [B, 1]
+                parts.append(self.dose_proj(log_dose))
+            else:
+                # No dose info: use zeros
+                parts.append(torch.zeros(emb.shape[0], self.dose_dim, device=emb.device))
+        parts.append(z)
+        cond_z = torch.cat(parts, dim=1)
         return cond_z, z
 
-    def forward(self, x, cond, n_steps: int = 1, z=None):
-        cond_z, _ = self._prepare_cond(cond, z)
+    def forward(self, x, cond, n_steps: int = 1, z=None, dose=None):
+        cond_z, _ = self._prepare_cond(cond, z, dose)
         for _ in range(n_steps):
             x = self.step(x, cond_z)
         return x
 
-    def forward_with_intermediate(self, x, cond, n_steps: int, t_intermediate: int, z=None):
-        cond_z, _ = self._prepare_cond(cond, z)
+    def forward_with_intermediate(self, x, cond, n_steps: int, t_intermediate: int,
+                                  z=None, dose=None):
+        cond_z, _ = self._prepare_cond(cond, z, dose)
         intermediate = None
         for t in range(n_steps):
             x = self.step(x, cond_z)
@@ -475,15 +521,15 @@ class LatentNCA(nn.Module):
                 intermediate = x
         return x, intermediate
 
-    def forward_with_style(self, x, cond, n_steps: int = 1, z=None):
+    def forward_with_style(self, x, cond, n_steps: int = 1, z=None, dose=None):
         """Forward that also returns (cond_z, z) for style reconstruction loss."""
-        cond_z, z = self._prepare_cond(cond, z)
+        cond_z, z = self._prepare_cond(cond, z, dose)
         for _ in range(n_steps):
             x = self.step(x, cond_z)
         return x, cond_z, z
 
-    def sample(self, x, cond, n_steps: int = 100, output_steps=None, z=None):
-        cond_z, _ = self._prepare_cond(cond, z)
+    def sample(self, x, cond, n_steps: int = 100, output_steps=None, z=None, dose=None):
+        cond_z, _ = self._prepare_cond(cond, z, dose)
         samples = []
         if output_steps is None or 0 in output_steps:
             samples.append(x.clone())

@@ -35,7 +35,7 @@ except ImportError:
     print("[warn] torchmetrics not installed — FID evaluation disabled")
 
 from nca_cellflow import IMPADataset, EvalDataset
-from nca_cellflow.models import BaseNCA, NoiseNCA, LatentNCA, NCAStyleEncoder, Discriminator, PatchDiscriminator
+from nca_cellflow.models import BaseNCA, NoiseNCA, LatentNCA, NCAStyleEncoder, Discriminator, PatchDiscriminator, TextureDiscriminator, SpectralMatchingLoss
 
 
 # ---------------------------------------------------------------------------
@@ -514,6 +514,108 @@ def compute_fid_trajectory(G, eval_dataset, device, args, img_channels, cond_fn=
 
 
 # ---------------------------------------------------------------------------
+# Texture quality metrics
+# ---------------------------------------------------------------------------
+
+def _radial_profile(mag: torch.Tensor) -> torch.Tensor:
+    """Azimuthally average a 2D magnitude tensor [H, W] → [max_radius]."""
+    H, W = mag.shape
+    cy, cx = H // 2, W // 2
+    max_r = min(cy, cx)
+    y, x = torch.meshgrid(torch.arange(H, device=mag.device),
+                           torch.arange(W, device=mag.device), indexing="ij")
+    r = torch.sqrt((y - cy).float() ** 2 + (x - cx).float() ** 2).long().clamp(max=max_r - 1)
+    profile = torch.zeros(max_r, device=mag.device)
+    counts = torch.zeros(max_r, device=mag.device)
+    profile.scatter_add_(0, r.reshape(-1), mag.reshape(-1))
+    counts.scatter_add_(0, r.reshape(-1), torch.ones_like(mag.reshape(-1)))
+    return profile / counts.clamp(min=1)
+
+
+@torch.no_grad()
+def compute_texture_stats(real_imgs: torch.Tensor, fake_imgs: torch.Tensor) -> dict:
+    """
+    Compute texture quality metrics comparing real and fake image batches.
+
+    Returns dict with:
+        spectrum_ratio_high: mean(P_fake/P_real) for top-quarter frequencies (< 1 = blurry)
+        spectrum_ratio_low:  mean(P_fake/P_real) for bottom-quarter frequencies
+        hf_energy_real: fraction of spectral energy in high frequencies (real)
+        hf_energy_fake: fraction of spectral energy in high frequencies (fake)
+        laplacian_var_real: mean Laplacian variance (real)
+        laplacian_var_fake: mean Laplacian variance (fake)
+        laplacian_ratio: fake / real (< 1 = blurry)
+    """
+    device = real_imgs.device
+
+    # --- Radial power spectrum ---
+    # Use full 2D FFT, shift DC to center, average across batch & channels
+    def mean_spectrum(imgs):
+        f = torch.fft.fft2(imgs)
+        f = torch.fft.fftshift(f, dim=(-2, -1))
+        mag = torch.log1p(f.abs())  # log-magnitude
+        return mag.mean(dim=(0, 1))  # average over batch and channels → [H, W]
+
+    spec_real = mean_spectrum(real_imgs)
+    spec_fake = mean_spectrum(fake_imgs)
+    profile_real = _radial_profile(spec_real)
+    profile_fake = _radial_profile(spec_fake)
+
+    max_r = profile_real.shape[0]
+    quarter = max_r // 4
+    ratio = profile_fake / profile_real.clamp(min=1e-6)
+    spectrum_ratio_low = ratio[:quarter].mean().item()
+    spectrum_ratio_high = ratio[-quarter:].mean().item()
+
+    # --- High-frequency energy fraction ---
+    def hf_energy_frac(imgs):
+        f = torch.fft.rfft2(imgs)
+        power = (f.abs() ** 2).mean(dim=(0, 1))  # [H, W//2+1]
+        H = power.shape[0]
+        total = power.sum()
+        # High freq = outer half of frequency space
+        hf_mask = torch.zeros_like(power, dtype=torch.bool)
+        cy = H // 2
+        cx = power.shape[1]  # rfft: only positive freqs
+        y = torch.arange(H, device=device)
+        x = torch.arange(cx, device=device)
+        yy, xx = torch.meshgrid(y, x, indexing="ij")
+        # Wrap y freqs: shift so DC is at center
+        yy_shift = torch.where(yy > cy, H - yy, yy)
+        r = torch.sqrt(yy_shift.float() ** 2 + xx.float() ** 2)
+        cutoff = min(cy, cx) / 2
+        hf_mask = r > cutoff
+        return (power[hf_mask].sum() / total.clamp(min=1e-8)).item()
+
+    hf_real = hf_energy_frac(real_imgs)
+    hf_fake = hf_energy_frac(fake_imgs)
+
+    # --- Laplacian variance (sharpness) ---
+    laplacian_kernel = torch.tensor(
+        [[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=torch.float32, device=device
+    ).reshape(1, 1, 3, 3).expand(real_imgs.shape[1], -1, -1, -1)
+
+    def lap_var(imgs):
+        lap = F.conv2d(imgs, laplacian_kernel, padding=1, groups=imgs.shape[1])
+        # Per-image variance, then mean across batch
+        return lap.var(dim=(-2, -1)).mean().item()
+
+    lap_real = lap_var(real_imgs)
+    lap_fake = lap_var(fake_imgs)
+
+    return {
+        "texture/spectrum_ratio_high": spectrum_ratio_high,
+        "texture/spectrum_ratio_low": spectrum_ratio_low,
+        "texture/hf_energy_real": hf_real,
+        "texture/hf_energy_fake": hf_fake,
+        "texture/hf_energy_ratio": hf_fake / max(hf_real, 1e-8),
+        "texture/laplacian_var_real": lap_real,
+        "texture/laplacian_var_fake": lap_fake,
+        "texture/laplacian_ratio": lap_fake / max(lap_real, 1e-8),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -555,6 +657,10 @@ def make_parser() -> argparse.ArgumentParser:
                    help="Threshold for alive mask (in [0,1] space for init, raw for NCA step)")
     p.add_argument("--step_size", type=float, default=0.1,
                    help="Residual update scale: x = x + dx * step_size")
+    p.add_argument("--dx_clip", type=float, default=10.0,
+                   help="Clamp dx to [-dx_clip, dx_clip] (ignored if use_tanh)")
+    p.add_argument("--use_tanh", action="store_true",
+                   help="Use tanh instead of clamp on dx (bounds to [-1,1])")
     p.add_argument("--nca_steps", type=int, default=60,
                    help="Number of NCA steps per generation")
 
@@ -568,6 +674,25 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--d_expansion", type=int, default=2)
     p.add_argument("--d_kernel_size", type=int, default=3)
     p.add_argument("--d_embed_dim", type=int, default=32)
+
+    # texture discriminator
+    p.add_argument("--texture_d", action="store_true",
+                   help="Add a shallow high-resolution texture discriminator head")
+    p.add_argument("--texture_d_channels", type=int, default=32,
+                   help="Channel width for texture discriminator")
+    p.add_argument("--texture_d_layers", type=int, default=3,
+                   help="Number of conv layers in texture discriminator")
+    p.add_argument("--texture_d_downsample", action="store_true",
+                   help="Apply one 2x downsampling in texture D (48x48→24x24)")
+    p.add_argument("--texture_d_weight", type=float, default=1.0,
+                   help="Weight for texture D loss relative to main D loss")
+
+    # spectral matching loss
+    p.add_argument("--spectral_weight", type=float, default=0.0,
+                   help="Weight for spectral matching loss (0 = disabled). "
+                        "Penalizes deviation of fake batch's power spectrum from precomputed real spectrum.")
+    p.add_argument("--spectral_max_samples", type=int, default=2000,
+                   help="Max samples per compound for spectrum precomputation")
 
     # training
     p.add_argument("--batch_size", type=int, default=32)
@@ -742,6 +867,8 @@ def train(args):
         fp_dim=fp_dim,
         fire_rate=args.fire_rate,
         step_size=args.step_size,
+        dx_clip=args.dx_clip,
+        use_tanh=args.use_tanh,
         use_alive_mask=args.use_alive_mask,
         alive_threshold=args.alive_threshold,
     )
@@ -796,6 +923,35 @@ def train(args):
         in_channels=img_channels,
     ).to(device)
 
+    # ---- Texture Discriminator (high-resolution texture head) ----
+    D_tex = None
+    if args.texture_d:
+        D_tex = TextureDiscriminator(
+            in_channels=img_channels,
+            base_channels=args.texture_d_channels,
+            num_layers=args.texture_d_layers,
+            num_classes=d_num_classes,
+            embed_dim=args.d_embed_dim,
+            downsample=args.texture_d_downsample,
+        ).to(device)
+
+    # ---- Spectral Matching Loss ----
+    spec_loss_fn = None
+    if args.spectral_weight > 0:
+        spec_loss_fn = SpectralMatchingLoss().to(device)
+        print("Precomputing per-compound power spectra...")
+        precomp_loader = torch.utils.data.DataLoader(
+            dataset, batch_size=64, shuffle=False, num_workers=args.num_workers,
+            drop_last=False, pin_memory=True,
+        )
+        target_spectra = SpectralMatchingLoss.precompute_spectrum(
+            precomp_loader, num_compounds, device=device,
+            max_samples_per_cpd=args.spectral_max_samples,
+        )
+        spec_loss_fn.register_targets(target_spectra)
+        del precomp_loader
+        print(f"Spectral targets: {target_spectra.shape}")
+
     # ---- StyleEncoder (for LatentNCA style reconstruction) ----
     use_style = args.style_weight > 0 and args.nca_type == "latent"
     S = None
@@ -809,6 +965,9 @@ def train(args):
     d_total, d_train = count_parameters(D)
     print(f"Generator  params: total={g_total:,}  trainable={g_train:,}")
     print(f"Discriminator params: total={d_total:,}  trainable={d_train:,}")
+    if D_tex is not None:
+        dt_total, dt_train = count_parameters(D_tex)
+        print(f"TextureD   params: total={dt_total:,}  trainable={dt_train:,}")
     if S is not None:
         s_total, s_train = count_parameters(S)
         print(f"StyleEncoder params: total={s_total:,}  trainable={s_train:,}")
@@ -817,12 +976,14 @@ def train(args):
     adam_kwargs = dict(betas=(args.beta1, args.beta2), eps=1e-8)
     # G optimizer includes StyleEncoder params when style loss is on
     g_params = list(G.parameters()) + (list(S.parameters()) if S is not None else [])
+    # D optimizer includes texture D params when texture D is on
+    d_params = list(D.parameters()) + (list(D_tex.parameters()) if D_tex is not None else [])
     try:
         G_opt = torch.optim.Adam(g_params, lr=args.lr_g, fused=True, **adam_kwargs)
-        D_opt = torch.optim.Adam(D.parameters(), lr=args.lr_d, fused=True, **adam_kwargs)
+        D_opt = torch.optim.Adam(d_params, lr=args.lr_d, fused=True, **adam_kwargs)
     except Exception:
         G_opt = torch.optim.Adam(g_params, lr=args.lr_g, **adam_kwargs)
-        D_opt = torch.optim.Adam(D.parameters(), lr=args.lr_d, **adam_kwargs)
+        D_opt = torch.optim.Adam(d_params, lr=args.lr_d, **adam_kwargs)
 
     # ---- AMP ----
     use_amp = device.type == "cuda"
@@ -838,6 +999,8 @@ def train(args):
         )
         if S is not None and extra and extra.get("S_state"):
             S.load_state_dict(extra["S_state"])
+        if D_tex is not None and extra and extra.get("D_tex_state"):
+            D_tex.load_state_dict(extra["D_tex_state"])
         print(f"Resuming from step {start_step}")
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
@@ -906,6 +1069,8 @@ def train(args):
         # ============== Discriminator step ==============
         set_requires_grad(G, False)
         set_requires_grad(D, True)
+        if D_tex is not None:
+            set_requires_grad(D_tex, True)
         D_opt.zero_grad(set_to_none=True)
 
         accum_d_loss = 0.0
@@ -915,6 +1080,7 @@ def train(args):
         accum_gp_fake = 0.0
         accum_d_real = 0.0
         accum_d_fake = 0.0
+        accum_d_tex = 0.0
 
         accum_d_inter = 0.0
 
@@ -946,6 +1112,22 @@ def train(args):
 
             d_loss = (adv_d + reg) / accum
             d_loss.backward()
+
+            # --- Texture discriminator (high-resolution head) ---
+            if D_tex is not None:
+                real_tex_req = img_trt.detach().requires_grad_(True)
+                fake_tex_req = fake_img.detach().requires_grad_(True)
+                with autocast():
+                    dt_real = D_tex(real_tex_req, cpd_id)
+                    dt_fake = D_tex(fake_tex_req, cpd_id)
+                    adv_tex = F.softplus(-(dt_real - dt_fake.mean())).mean() \
+                            + F.softplus(dt_fake - dt_real.mean()).mean()
+                gp_tex_real = multi_scale_gp(real_tex_req.float(), dt_real.float())
+                gp_tex_fake = multi_scale_gp(fake_tex_req.float(), dt_fake.float())
+                reg_tex = 0.5 * args.gamma * (gp_tex_real.mean() + gp_tex_fake.mean())
+                d_tex_loss = args.texture_d_weight * (adv_tex + reg_tex) / accum
+                d_tex_loss.backward()
+                accum_d_tex += d_tex_loss.item()
 
             # --- Null class D on actual intermediate (for intermediate and/or gradual) ---
             if use_intermediate or use_gradual:
@@ -988,6 +1170,8 @@ def train(args):
         # ============== Generator step ==============
         set_requires_grad(G, True)
         set_requires_grad(D, False)
+        if D_tex is not None:
+            set_requires_grad(D_tex, False)
         G_opt.zero_grad(set_to_none=True)
 
         accum_g_loss = 0.0
@@ -995,6 +1179,8 @@ def train(args):
         accum_g_inter = 0.0
         accum_g_gradual = 0.0
         accum_style_loss = 0.0
+        accum_g_tex = 0.0
+        accum_spectral = 0.0
 
         for nca_input, img_trt, cpd_id in shared_batches:
             # Pre-compute style + z for LatentNCA (so we can pass z and get style for loss)
@@ -1117,6 +1303,22 @@ def train(args):
                 total_loss = total_loss + args.style_weight * sty_loss
                 accum_style_loss += sty_loss.item()
 
+            # --- Texture D G-loss ---
+            if D_tex is not None:
+                with autocast():
+                    dt_real_g = D_tex(img_trt.detach(), cpd_id)
+                    dt_fake_g = D_tex(fake_img, cpd_id)
+                g_tex_loss = args.texture_d_weight * F.softplus(-(dt_fake_g - dt_real_g)).mean() / accum
+                total_loss = total_loss + g_tex_loss
+                accum_g_tex += g_tex_loss.item()
+
+            # --- Spectral matching loss ---
+            if spec_loss_fn is not None:
+                with autocast():
+                    s_loss = spec_loss_fn(fake_img, cpd_id) / accum
+                total_loss = total_loss + args.spectral_weight * s_loss
+                accum_spectral += s_loss.item()
+
             total_loss.backward()
 
             accum_g_loss += g_loss.item()
@@ -1203,6 +1405,11 @@ def train(args):
             log_dict["loss/G_inter"] = accum_g_inter
         if use_gradual:
             log_dict["loss/G_gradual"] = accum_g_gradual
+        if D_tex is not None:
+            log_dict["loss/D_tex"] = accum_d_tex
+            log_dict["loss/G_tex"] = accum_g_tex
+        if spec_loss_fn is not None:
+            log_dict["loss/spectral"] = accum_spectral
         for k, v in log_dict.items():
             logs[k].append(v)
 
@@ -1227,37 +1434,65 @@ def train(args):
                 cond_fn=cond_fn,
             )
 
-        # ============== FID (test split) ==============
-        if args.fid_every > 0 and (step + 1) % args.fid_every == 0 and eval_dataset is not None:
-            fid_G = G_ema.module if use_ema else G
-            fid_global, fid_per_cpd = compute_fid(
-                fid_G, eval_dataset, device, args, id2cpd, img_channels,
-                cond_fn=cond_fn,
-            )
-            if fid_global is not None:
-                fid_log = {"fid/global": fid_global}
-                fid_vals = []
-                for cpd_name, fid_val in fid_per_cpd.items():
-                    fid_log[f"fid/cpd/{cpd_name}"] = fid_val
-                    fid_vals.append(fid_val)
-                if fid_vals:
-                    fid_log["fid/mean_per_cpd"] = np.mean(fid_vals)
-                print(f"[FID] global={fid_global:.2f}  mean_per_cpd={np.mean(fid_vals):.2f}")
-                if use_wandb:
-                    wandb.log(fid_log, step=step + 1)
-                logs["fid/global"].append(fid_global)
+        # ============== Evaluation metrics (FID + texture stats) ==============
+        if args.fid_every > 0 and (step + 1) % args.fid_every == 0:
+            eval_log = {}
+            eval_G = G_ema.module if use_ema else G
+            eval_G.eval()
+
+            # Texture quality stats (from last training batch — no extra forward pass)
+            tex_nca_input, tex_img_trt, tex_cpd_id = shared_batches[-1]
+            with torch.no_grad():
+                tex_fake_full = eval_G(tex_nca_input, cond_fn(tex_cpd_id), n_steps=args.nca_steps)
+                tex_fake_img = tex_fake_full[:, :img_channels].contiguous()
+            tex_stats = compute_texture_stats(tex_img_trt[:, :img_channels], tex_fake_img)
+            eval_log.update(tex_stats)
+            for k, v in tex_stats.items():
+                logs[k].append(v)
+
+            # FID (test split)
+            if eval_dataset is not None:
+                fid_global, fid_per_cpd = compute_fid(
+                    eval_G, eval_dataset, device, args, id2cpd, img_channels,
+                    cond_fn=cond_fn,
+                )
+                if fid_global is not None:
+                    eval_log["fid/global"] = fid_global
+                    fid_vals = []
+                    for cpd_name, fid_val in fid_per_cpd.items():
+                        eval_log[f"fid/cpd/{cpd_name}"] = fid_val
+                        fid_vals.append(fid_val)
+                    if fid_vals:
+                        eval_log["fid/mean_per_cpd"] = np.mean(fid_vals)
+                    logs["fid/global"].append(fid_global)
+
+            if use_wandb and eval_log:
+                wandb.log(eval_log, step=step + 1)
+            eval_G.train()
 
         # ============== FID trajectory (per-step FID vs all real cells) ==============
         if args.fid_trajectory_every > 0 and (step + 1) % args.fid_trajectory_every == 0 and eval_dataset is not None:
             traj_G = G_ema.module if use_ema else G
+            traj_log = {}
+
+            # Texture stats at trajectory eval too
+            traj_G.eval()
+            tex_nca_input, tex_img_trt, tex_cpd_id = shared_batches[-1]
+            with torch.no_grad():
+                tex_fake_full = traj_G(tex_nca_input, cond_fn(tex_cpd_id), n_steps=args.nca_steps)
+                tex_fake_img = tex_fake_full[:, :img_channels].contiguous()
+            tex_stats = compute_texture_stats(tex_img_trt[:, :img_channels], tex_fake_img)
+            traj_log.update(tex_stats)
+
             fid_traj = compute_fid_trajectory(
                 traj_G, eval_dataset, device, args, img_channels, cond_fn=cond_fn,
             )
             if fid_traj is not None:
-                traj_log = {f"fid_traj/step_{t}": v for t, v in fid_traj.items()}
-                print(f"[FID traj] " + "  ".join(f"t={t}:{v:.1f}" for t, v in sorted(fid_traj.items())))
-                if use_wandb:
-                    wandb.log(traj_log, step=step + 1)
+                for t, v in fid_traj.items():
+                    traj_log[f"fid_traj/step_{t}"] = v
+            if use_wandb and traj_log:
+                wandb.log(traj_log, step=step + 1)
+            traj_G.train()
 
         # ============== Checkpointing ==============
         is_save_step = (step + 1) % args.save_every == 0
@@ -1286,6 +1521,8 @@ def train(args):
                     "ema_warmup_steps": args.ema_warmup_steps,
                     "diversity_weight": args.diversity_weight,
                     "step_size": args.step_size,
+                    "dx_clip": args.dx_clip,
+                    "use_tanh": args.use_tanh,
                     "use_alive_mask": args.use_alive_mask,
                     "alive_threshold": args.alive_threshold,
                     "cond_type": args.cond_type,
@@ -1295,6 +1532,11 @@ def train(args):
                     "gradual_weight": args.gradual_weight,
                     "style_weight": args.style_weight,
                     "S_state": S.state_dict() if S is not None else None,
+                    "D_tex_state": D_tex.state_dict() if D_tex is not None else None,
+                    "texture_d": args.texture_d,
+                    "texture_d_channels": args.texture_d_channels,
+                    "texture_d_layers": args.texture_d_layers,
+                    "spectral_weight": args.spectral_weight,
                     "wandb_run_id": wandb.run.id if use_wandb else None,
                 },
             )

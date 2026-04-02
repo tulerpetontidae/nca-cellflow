@@ -7,6 +7,7 @@ using BBBC021 dataset.
 
 __version__ = "0.1.0"
 
-from .dataset import IMPADataset, EvalDataset
+from .dataset import IMPADataset, EvalDataset, LabeledImageBank
+from .pool import ReplayPool
 
-__all__ = ["IMPADataset", "EvalDataset", "__version__"]
+__all__ = ["IMPADataset", "EvalDataset", "LabeledImageBank", "ReplayPool", "__version__"]
