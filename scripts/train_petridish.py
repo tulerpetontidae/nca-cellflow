@@ -218,7 +218,9 @@ def compute_fid_global(G, eval_dataset, device, args, img_channels):
         G.train()
         return fid
     except Exception as e:
+        import traceback
         print(f"[warn] FID failed: {e}")
+        traceback.print_exc()
         G.train()
         return None
 
@@ -822,7 +824,8 @@ def main():
 
         # ============ FID ============
         if args.fid_every > 0 and step > 0 and step % args.fid_every == 0 and eval_dataset is not None:
-            fid_val = compute_fid_global(G, eval_dataset, device, args, img_channels)
+            fid_model = G_ema.module if G_ema is not None else G
+            fid_val = compute_fid_global(fid_model, eval_dataset, device, args, img_channels)
             if fid_val is not None:
                 wandb_dict["fid/global"] = fid_val
                 print(f"[FID] global={fid_val:.1f}")
