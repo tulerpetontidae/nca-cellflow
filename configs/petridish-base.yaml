@@ -52,6 +52,7 @@ ema_warmup_steps: 1000
 # logging
 save_every: 2000
 log_every: 5
-vis_every: 500
+vis_every: 1000
+fid_every: 2000
 wandb: true
 wandb_project: nca-petridish

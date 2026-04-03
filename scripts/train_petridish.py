@@ -29,8 +29,16 @@ except ImportError:
     WANDB_AVAILABLE = False
     print("[warn] wandb not installed")
 
-from nca_cellflow import LabeledImageBank, ReplayPool
+try:
+    from torchmetrics.image.fid import FrechetInceptionDistance
+    FID_AVAILABLE = True
+except ImportError:
+    FID_AVAILABLE = False
+    print("[warn] torchmetrics not installed — FID disabled")
+
+from nca_cellflow import LabeledImageBank, ReplayPool, EvalDataset
 from nca_cellflow.models import LatentNCA, NCAStyleEncoder, Discriminator, PatchDiscriminator
+from torch.utils.data import DataLoader
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +166,61 @@ def plot_pool_samples(pool, id2label, step, n=16):
     iters = [pool.iters[i].item() for i in indices]
     titles = [f"{id2label.get(l, '?')} d={d:.2g} i={it}" for l, d, it in zip(labels, doses, iters)]
     return plot_image_grid(images, titles, f"Pool states (step {step})")
+
+
+# ---------------------------------------------------------------------------
+# FID Evaluation
+# ---------------------------------------------------------------------------
+
+_fid_metric = None
+
+
+@torch.no_grad()
+def compute_fid_global(G, eval_dataset, device, args, img_channels):
+    """Compute global FID on test set. Returns float or None on failure."""
+    global _fid_metric
+    if not FID_AVAILABLE:
+        return None
+    try:
+        if _fid_metric is None:
+            _fid_metric = FrechetInceptionDistance(normalize=True).to(device)
+        _fid_metric.reset()
+
+        loader = DataLoader(eval_dataset, batch_size=64, shuffle=False,
+                            num_workers=0, pin_memory=False, drop_last=False)
+        G.eval()
+        for img_ctrl, img_trt, cpd_id, dose in loader:
+            img_ctrl = img_ctrl.to(device)
+            img_trt = img_trt.to(device)
+            cpd_id = cpd_id.to(device)
+            dose = dose.to(device)
+
+            if args.hidden_channels > 0:
+                pad = torch.zeros(img_ctrl.shape[0], args.hidden_channels,
+                                  img_ctrl.shape[2], img_ctrl.shape[3], device=device)
+                nca_input = torch.cat([img_ctrl, pad], dim=1)
+            else:
+                nca_input = img_ctrl
+
+            # Shift cpd_id by +1 (EvalDataset uses 0-indexed, petri dish uses 1-indexed with 0=DMSO)
+            fake_full = G(nca_input, cpd_id + 1, n_steps=args.nca_steps, dose=dose)
+            fake_rgb = fake_full[:, :img_channels].contiguous()
+
+            real_01 = (img_trt[:, :img_channels].clamp(-1, 1) + 1) / 2
+            real_01 = torch.floor(real_01 * 255).float() / 255.0
+            fake_01 = (fake_rgb.clamp(-1, 1) + 1) / 2
+            fake_01 = torch.floor(fake_01 * 255).float() / 255.0
+
+            _fid_metric.update(real_01, real=True)
+            _fid_metric.update(fake_01, real=False)
+
+        fid = _fid_metric.compute().item()
+        G.train()
+        return fid
+    except Exception as e:
+        print(f"[warn] FID failed: {e}")
+        G.train()
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +358,8 @@ def make_parser():
     p.add_argument("--save_every", type=int, default=2000)
     p.add_argument("--log_every", type=int, default=5)
     p.add_argument("--vis_every", type=int, default=500)
+    p.add_argument("--fid_every", type=int, default=0,
+                   help="Compute global FID every N steps (0 = disabled)")
     p.add_argument("--checkpoint_dir", type=str, default="checkpoints")
     p.add_argument("--resume", type=str, default=None)
     p.add_argument("--device", type=str, default=None)
@@ -348,6 +413,12 @@ def main():
     # Label map: cpd_id -> display name
     id2label = {0: "DMSO"}
     id2label.update(image_bank.id2cpd)
+
+    # ---- Eval dataset for FID ----
+    eval_dataset = None
+    if args.fid_every > 0:
+        eval_dataset = EvalDataset(args.metadata_csv, args.image_dir,
+                                   split="test", image_size=args.image_size)
 
     # ---- Transition table ----
     targets_for, weights_for = build_transition_table(image_bank, args.homeo_weight)
@@ -651,7 +722,9 @@ def main():
             img_channels=img_channels, hidden_channels=args.hidden_channels,
         )
 
-        # ============ Logging ============
+        # ============ Logging (single wandb.log per step) ============
+        wandb_dict = {}
+
         if step % args.log_every == 0:
             log_dict = {
                 "loss/D_total": d_loss.item(),
@@ -679,16 +752,12 @@ def main():
                 "G": f"{g_loss.item():.3f}",
                 "rec": n_recycled,
             })
-
-            if use_wandb:
-                wandb.log(log_dict, step=step)
+            wandb_dict.update(log_dict)
 
         # ============ Visualization ============
         if step % args.vis_every == 0 and step > 0:
             G.eval()
-            # Pool state samples
             fig_pool = plot_pool_samples(pool, id2label, step)
-            # Generated vs real
             n = min(8, args.batch_size)
             fig_gen = plot_image_grid(
                 [fake_img[i, :3].detach() for i in range(n)],
@@ -702,14 +771,22 @@ def main():
                  for i in range(n)],
                 f"Real targets (step {step})",
             )
-            if use_wandb:
-                wandb.log({
-                    "vis/pool_states": wandb.Image(fig_pool),
-                    "vis/generated": wandb.Image(fig_gen),
-                    "vis/real_targets": wandb.Image(fig_real),
-                }, step=step)
+            wandb_dict["vis/pool_states"] = wandb.Image(fig_pool) if use_wandb else None
+            wandb_dict["vis/generated"] = wandb.Image(fig_gen) if use_wandb else None
+            wandb_dict["vis/real_targets"] = wandb.Image(fig_real) if use_wandb else None
             plt.close("all")
             G.train()
+
+        # ============ FID ============
+        if args.fid_every > 0 and step > 0 and step % args.fid_every == 0 and eval_dataset is not None:
+            fid_val = compute_fid_global(G, eval_dataset, device, args, img_channels)
+            if fid_val is not None:
+                wandb_dict["fid/global"] = fid_val
+                print(f"[FID] global={fid_val:.1f}")
+
+        # Single wandb.log call per step
+        if use_wandb and wandb_dict:
+            wandb.log({k: v for k, v in wandb_dict.items() if v is not None}, step=step)
 
         # ============ Save checkpoint ============
         if step % args.save_every == 0 and step > 0:
