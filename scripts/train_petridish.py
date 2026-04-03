@@ -228,41 +228,62 @@ def compute_fid_global(G, eval_dataset, device, args, img_channels):
 # ---------------------------------------------------------------------------
 
 def build_transition_table(image_bank, homeo_weight=3.0):
-    """Build transition table: for each (cpd_id, dose) -> list of (target_cpd, target_dose, weight).
+    """Build plate-aware transition tables.
 
-    Transitions:
-      - DMSO → DMSO (homeostasis)
-      - DMSO → (compound, dose) (drug application)
-      - (cpd, dose) → (cpd, dose) (hold treated phenotype)
-      - (cpd, dose) → DMSO (drug removal / recovery)
+    Each plate has its own set of available (compound, dose) targets.
+    DMSO on plate X can only transition to compounds on plate X.
+
+    Returns:
+        plate_targets: {plate -> {(cpd_id, dose) -> [(target_cpd, target_dose), ...]}}
+        plate_weights: {plate -> {(cpd_id, dose) -> np array of weights}}
     """
-    targets_for = {}  # (cpd_id, dose) -> list of (target_cpd, target_dose)
-    weights_for = {}  # (cpd_id, dose) -> np array of weights
+    plate_targets = {}
+    plate_weights = {}
 
-    available = image_bank.available_targets  # list of (cpd_id, dose) for compounds
+    # Build per-plate available targets
+    plate_to_targets = defaultdict(list)
+    for cpd_id, doses_dict in image_bank._index.items():
+        if cpd_id == 0:
+            continue  # skip DMSO
+        for dose, plates_dict in doses_dict.items():
+            for plate in plates_dict:
+                plate_to_targets[plate].append((cpd_id, dose))
 
-    # DMSO transitions
-    dmso_targets = [(0, 0.0)]  # homeostasis
-    dmso_weights = [homeo_weight]
-    for cpd_id, dose in available:
-        dmso_targets.append((cpd_id, dose))
-        dmso_weights.append(1.0)
-    w = np.array(dmso_weights)
-    targets_for[(0, 0.0)] = dmso_targets
-    weights_for[(0, 0.0)] = w / w.sum()
+    # Also include plates that only have DMSO
+    for plate in image_bank._index[0][0.0]:
+        if plate not in plate_to_targets:
+            plate_to_targets[plate] = []
 
-    # Compound transitions
-    for cpd_id, dose in available:
-        tgts = [(cpd_id, dose), (0, 0.0)]  # homeostasis + recovery
-        ws = np.array([homeo_weight, 1.0])
-        targets_for[(cpd_id, dose)] = tgts
-        weights_for[(cpd_id, dose)] = ws / ws.sum()
+    for plate, available in plate_to_targets.items():
+        tbl_targets = {}
+        tbl_weights = {}
 
-    return targets_for, weights_for
+        # DMSO transitions: homeo + forward to plate-local compounds
+        dmso_tgts = [(0, 0.0)]  # homeostasis
+        dmso_ws = [homeo_weight]
+        for cpd_id, dose in available:
+            dmso_tgts.append((cpd_id, dose))
+            dmso_ws.append(1.0)
+        w = np.array(dmso_ws)
+        tbl_targets[(0, 0.0)] = dmso_tgts
+        tbl_weights[(0, 0.0)] = w / w.sum()
+
+        # Compound transitions: homeo + recovery to DMSO
+        for cpd_id, dose in available:
+            tgts = [(cpd_id, dose), (0, 0.0)]
+            ws = np.array([homeo_weight, 1.0])
+            tbl_targets[(cpd_id, dose)] = tgts
+            tbl_weights[(cpd_id, dose)] = ws / ws.sum()
+
+        plate_targets[plate] = tbl_targets
+        plate_weights[plate] = tbl_weights
+
+    return plate_targets, plate_weights
 
 
-def sample_targets(current_labels, current_doses, targets_for, weights_for):
-    """Sample target (cpd_id, dose) for each item in batch using transition table.
+def sample_targets(current_labels, current_doses, plates,
+                   plate_targets, plate_weights):
+    """Sample target (cpd_id, dose) per item using plate-aware transition table.
 
     Returns:
         target_labels: [B] long tensor
@@ -274,17 +295,25 @@ def sample_targets(current_labels, current_doses, targets_for, weights_for):
     target_doses = torch.zeros(B, dtype=torch.float32, device=current_labels.device)
 
     for i in range(B):
+        plate = plates[i]
         key = (current_labels[i].item(), current_doses[i].item())
-        if key not in targets_for:
-            # Fallback: treat as DMSO
+
+        tbl = plate_targets.get(plate, {})
+        if key not in tbl:
             key = (0, 0.0)
-        tgts = targets_for[key]
-        ws = weights_for[key]
+        if key not in tbl:
+            # Plate has no transition table (shouldn't happen)
+            target_labels[i] = 0
+            target_doses[i] = 0.0
+            continue
+
+        tgts = tbl[key]
+        ws = plate_weights[plate][key]
         idx = np.random.choice(len(tgts), p=ws)
         target_labels[i] = tgts[idx][0]
         target_doses[i] = tgts[idx][1]
 
-    is_homeo = (target_labels == current_labels) & (target_doses == current_doses)
+    is_homeo = (target_labels == current_labels) & (torch.abs(target_doses - current_doses) < 1e-6)
     return target_labels, target_doses, is_homeo
 
 
@@ -421,7 +450,7 @@ def main():
                                    split="test", image_size=args.image_size)
 
     # ---- Transition table ----
-    targets_for, weights_for = build_transition_table(image_bank, args.homeo_weight)
+    plate_targets, plate_weights = build_transition_table(image_bank, args.homeo_weight)
 
     # ---- Models ----
     img_channels = 3
@@ -544,7 +573,8 @@ def main():
 
         # ============ 2. Sample targets ============
         target_labels, target_doses, is_homeo = sample_targets(
-            pool_labels, pool_doses, targets_for, weights_for)
+            pool_labels, pool_doses, pool_plates,
+            plate_targets, plate_weights)
         target_labels = target_labels.to(device)
         target_doses = target_doses.to(device)
 
@@ -759,16 +789,29 @@ def main():
             G.eval()
             fig_pool = plot_pool_samples(pool, id2label, step)
             n = min(8, args.batch_size)
+
+            # Build per-sample task labels: homeo / forward / recovery
+            vis_titles = []
+            for i in range(n):
+                src = id2label.get(pool_labels[i].item(), "?")
+                tgt = id2label.get(target_labels[i].item(), "?")
+                dose_str = f"d={target_doses[i].item():.2g}" if target_doses[i].item() > 0 else ""
+                if is_homeo[i]:
+                    task = "homeo"
+                elif pool_labels[i].item() == 0:  # DMSO → drug
+                    task = "fwd"
+                else:  # drug → DMSO
+                    task = "rev"
+                vis_titles.append(f"{task}: {src}→{tgt} {dose_str}".strip())
+
             fig_gen = plot_image_grid(
                 [fake_img[i, :3].detach() for i in range(n)],
-                [f"{id2label.get(target_labels[i].item(), '?')} d={target_doses[i].item():.2g}"
-                 for i in range(n)],
+                vis_titles[:n],
                 f"Generated (step {step})",
             )
             fig_real = plot_image_grid(
                 [real_img[i, :3] for i in range(n)],
-                [f"{id2label.get(target_labels[i].item(), '?')} d={target_doses[i].item():.2g}"
-                 for i in range(n)],
+                vis_titles[:n],
                 f"Real targets (step {step})",
             )
             wandb_dict["vis/pool_states"] = wandb.Image(fig_pool) if use_wandb else None
