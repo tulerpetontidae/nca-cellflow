@@ -210,6 +210,7 @@ class EvalDataset(Dataset):
         self.ctrl_keys = ctrl["SAMPLE_KEY"].values
         self.trt_keys = trt["SAMPLE_KEY"].values
         self.trt_cpd = trt["CPD_NAME"].values
+        self.trt_dose = trt["DOSE"].values.astype(np.float32)
 
         cpds = sorted(set(self.trt_cpd))
         self.cpd2id = {c: i for i, c in enumerate(cpds)}
@@ -233,6 +234,7 @@ class EvalDataset(Dataset):
     def __getitem__(self, idx):
         img_trt = self._load(self.trt_keys[idx])
         cpd_id = self.cpd2id[self.trt_cpd[idx]]
+        dose = self.trt_dose[idx]
 
         # Deterministic ctrl: pick from same plate using idx as seed
         plate = self._trt_plates[idx]
@@ -243,7 +245,7 @@ class EvalDataset(Dataset):
             ci = idx % len(self.ctrl_keys)
         img_ctrl = self._load(self.ctrl_keys[ci])
 
-        return img_ctrl, img_trt, cpd_id
+        return img_ctrl, img_trt, cpd_id, dose
 
     def _load(self, key: str) -> torch.Tensor:
         return _load_image(self.image_dir, key, self.image_size, augment=False)
