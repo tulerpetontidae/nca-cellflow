@@ -36,6 +36,11 @@ configs = [
         "config": "configs/petridish-base.yaml",
         "nca_hidden_dim": 256,
     },
+    # 4. Lower homeostasis weight
+    {
+        "wandb_name": "petridish-homeo1",
+        "config": "configs/petridish-homeo1.yaml",
+    },
 ]
 
 

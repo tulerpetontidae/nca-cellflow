@@ -31,10 +31,12 @@ except ImportError:
 
 try:
     from torchmetrics.image.fid import FrechetInceptionDistance
+    # torch-fidelity is required at runtime for InceptionV3 weights
+    FrechetInceptionDistance(normalize=True)
     FID_AVAILABLE = True
-except ImportError:
+except (ImportError, ModuleNotFoundError) as e:
     FID_AVAILABLE = False
-    print("[warn] torchmetrics not installed — FID disabled")
+    print(f"[warn] FID disabled: {e}")
 
 from nca_cellflow import LabeledImageBank, ReplayPool, EvalDataset
 from nca_cellflow.models import LatentNCA, NCAStyleEncoder, Discriminator, PatchDiscriminator
@@ -139,33 +141,153 @@ def save_checkpoint(path, step, G, D, G_opt, D_opt, logs, extra=None,
 # Visualization
 # ---------------------------------------------------------------------------
 
-def plot_image_grid(images, titles, suptitle, max_images=16):
-    n = min(len(images), max_images)
-    ncols = min(n, 4)
-    nrows = (n + ncols - 1) // ncols
-    fig, axes = plt.subplots(nrows, ncols, figsize=(3 * ncols, 3 * nrows))
-    axes = np.atleast_2d(axes)
-    for i in range(nrows * ncols):
-        r, c = divmod(i, ncols)
-        ax = axes[r, c]
-        if i < n:
-            ax.imshow(to_rgb_numpy(images[i]))
-            ax.set_title(titles[i], fontsize=14)
-        ax.axis("off")
-    fig.suptitle(suptitle, fontsize=20)
-    plt.tight_layout()
-    return fig
+@torch.no_grad()
+def vis_petridish(G_eval, image_bank, id2label, device, step,
+                  n_steps, img_channels, hidden_channels,
+                  n_cells=4, n_rounds=4):
+    """Generate 3 evaluation figures: homeostasis, transitions, recovery.
 
+    Returns dict of {name: matplotlib figure}.
+    """
+    G_eval.eval()
+    cpd_targets = {}
+    for cpd_id, dose in image_bank.available_targets:
+        if cpd_id not in cpd_targets:
+            cpd_targets[cpd_id] = []
+        cpd_targets[cpd_id].append(dose)
+    # Pick middle dose per compound
+    cpd_dose = {cid: sorted(ds)[len(ds) // 2] for cid, ds in cpd_targets.items()}
+    cpd_ids = sorted(cpd_dose.keys())
+    n_cpds = len(cpd_ids)
 
-def plot_pool_samples(pool, id2label, step, n=16):
-    """Show a random sample of current pool states."""
-    indices = torch.randperm(pool.pool_size)[:n]
-    images = [pool.states[i, :3] for i in indices]
-    labels = [pool.labels[i].item() for i in indices]
-    doses = [pool.doses[i].item() for i in indices]
-    iters = [pool.iters[i].item() for i in indices]
-    titles = [f"{id2label.get(l, '?')} d={d:.2g} i={it}" for l, d, it in zip(labels, doses, iters)]
-    return plot_image_grid(images, titles, f"Pool states (step {step})")
+    def _prep(imgs):
+        x = imgs.to(device)
+        if hidden_channels > 0:
+            pad = torch.zeros(x.shape[0], hidden_channels, x.shape[2], x.shape[3], device=device)
+            x = torch.cat([x, pad], dim=1)
+        return x
+
+    def _rgb(state):
+        return ((state[:, :img_channels].detach().cpu().clamp(-1, 1) + 1) / 2).permute(0, 2, 3, 1).numpy()
+
+    # Sample control images (shared across all figures)
+    ctrl_imgs = []
+    for _ in range(n_cells):
+        img, _ = image_bank.sample_one(0, dose=0.0)
+        ctrl_imgs.append(img)
+    ctrl_imgs = torch.stack(ctrl_imgs)
+    ctrl_rgb = _rgb(ctrl_imgs.unsqueeze(0).squeeze(0) if ctrl_imgs.dim() == 3 else ctrl_imgs)
+    # fix: ctrl_imgs is [N,C,H,W]
+    ctrl_rgb = ((ctrl_imgs.clamp(-1, 1) + 1) / 2).permute(0, 2, 3, 1).numpy()
+
+    # --- Figure 1: Homeostasis ---
+    # rows = cells, cols = [input, round1..n_rounds]
+    state = _prep(ctrl_imgs)
+    homeo_snaps = [ctrl_rgb.copy()]
+    cond = torch.zeros(n_cells, dtype=torch.long, device=device)
+    dose_t = torch.zeros(n_cells, device=device)
+    for _ in range(n_rounds):
+        state = G_eval(state, cond, n_steps=n_steps, dose=dose_t)
+        homeo_snaps.append(_rgb(state))
+
+    fig_h, axes = plt.subplots(n_cells, n_rounds + 1, figsize=(2 * (n_rounds + 1), 2 * n_cells))
+    if n_cells == 1:
+        axes = axes[np.newaxis, :]
+    for i in range(n_cells):
+        for r in range(n_rounds + 1):
+            axes[i, r].imshow(homeo_snaps[r][i])
+            axes[i, r].axis("off")
+            if i == 0:
+                axes[0, r].set_title("Input" if r == 0 else f"R{r}", fontsize=10)
+    fig_h.suptitle(f"Homeostasis (step {step})", fontsize=14, y=1.01)
+    fig_h.tight_layout()
+
+    # --- Figure 2: Transitions (DMSO -> each compound, 4 rounds) ---
+    # rows = compounds, cols = [input, round1..n_rounds, real]
+    ncols_t = n_rounds + 2  # input + rounds + real
+    fig_t, axes = plt.subplots(n_cpds, ncols_t * n_cells,
+                                figsize=(1.5 * ncols_t * n_cells, 1.8 * n_cpds))
+    if n_cpds == 1:
+        axes = axes[np.newaxis, :]
+
+    for row, cid in enumerate(cpd_ids):
+        dose_val = cpd_dose[cid]
+        cond = torch.full((n_cells,), cid, dtype=torch.long, device=device)
+        dose_t = torch.full((n_cells,), dose_val, device=device)
+        state = _prep(ctrl_imgs)
+        snaps = [ctrl_rgb.copy()]
+        for _ in range(n_rounds):
+            state = G_eval(state, cond, n_steps=n_steps, dose=dose_t)
+            snaps.append(_rgb(state))
+        # Sample real treated
+        real_imgs = []
+        for _ in range(n_cells):
+            img, _ = image_bank.sample_one(cid, dose=dose_val)
+            real_imgs.append(img)
+        real_rgb = ((torch.stack(real_imgs).clamp(-1, 1) + 1) / 2).permute(0, 2, 3, 1).numpy()
+        snaps.append(real_rgb)
+
+        for ci in range(n_cells):
+            for c in range(ncols_t):
+                col = ci * ncols_t + c
+                axes[row, col].imshow(snaps[c][ci])
+                axes[row, col].axis("off")
+                if row == 0 and ci == 0:
+                    if c == 0:
+                        axes[0, col].set_title("In", fontsize=8)
+                    elif c < ncols_t - 1:
+                        axes[0, col].set_title(f"R{c}", fontsize=8)
+                    else:
+                        axes[0, col].set_title("Real", fontsize=8)
+        axes[row, 0].set_ylabel(f"{id2label.get(cid, '?')}", fontsize=8,
+                                 rotation=0, labelpad=35, va="center")
+    fig_t.suptitle(f"Transitions: DMSO -> drug (step {step})", fontsize=14, y=1.01)
+    fig_t.tight_layout()
+
+    # --- Figure 3: Recovery (1 round drug -> 3 rounds DMSO) ---
+    n_rec = min(n_rounds - 1, 3)
+    ncols_r = 1 + 1 + n_rec  # input + drug + recovery rounds
+    fig_r, axes = plt.subplots(n_cpds, ncols_r * n_cells,
+                                figsize=(1.5 * ncols_r * n_cells, 1.8 * n_cpds))
+    if n_cpds == 1:
+        axes = axes[np.newaxis, :]
+
+    for row, cid in enumerate(cpd_ids):
+        dose_val = cpd_dose[cid]
+        state = _prep(ctrl_imgs)
+        snaps = [ctrl_rgb.copy()]
+
+        # 1 round with drug
+        cond = torch.full((n_cells,), cid, dtype=torch.long, device=device)
+        dose_t = torch.full((n_cells,), dose_val, device=device)
+        state = G_eval(state, cond, n_steps=n_steps, dose=dose_t)
+        snaps.append(_rgb(state))
+
+        # n_rec rounds recovery (DMSO)
+        cond_dmso = torch.zeros(n_cells, dtype=torch.long, device=device)
+        dose_dmso = torch.zeros(n_cells, device=device)
+        for _ in range(n_rec):
+            state = G_eval(state, cond_dmso, n_steps=n_steps, dose=dose_dmso)
+            snaps.append(_rgb(state))
+
+        for ci in range(n_cells):
+            for c in range(ncols_r):
+                col = ci * ncols_r + c
+                axes[row, col].imshow(snaps[c][ci])
+                axes[row, col].axis("off")
+                if row == 0 and ci == 0:
+                    if c == 0:
+                        axes[0, col].set_title("In", fontsize=8)
+                    elif c == 1:
+                        axes[0, col].set_title("+Drug", fontsize=8)
+                    else:
+                        axes[0, col].set_title(f"Rec{c-1}", fontsize=8)
+        axes[row, 0].set_ylabel(f"{id2label.get(cid, '?')}", fontsize=8,
+                                 rotation=0, labelpad=35, va="center")
+    fig_r.suptitle(f"Recovery: drug -> DMSO (step {step})", fontsize=14, y=1.01)
+    fig_r.tight_layout()
+
+    return {"vis/homeostasis": fig_h, "vis/transitions": fig_t, "vis/recovery": fig_r}
 
 
 # ---------------------------------------------------------------------------
@@ -338,9 +460,9 @@ def make_parser():
     p.add_argument("--dose_dim", type=int, default=8)
     p.add_argument("--hidden_channels", type=int, default=6)
     p.add_argument("--fire_rate", type=float, default=1.0)
-    p.add_argument("--step_size", type=float, default=0.005)
+    p.add_argument("--step_size", type=float, default=0.027)
     p.add_argument("--use_tanh", action="store_true", default=True)
-    p.add_argument("--nca_steps", type=int, default=60)
+    p.add_argument("--nca_steps", type=int, default=55)
 
     # discriminator
     p.add_argument("--d_type", type=str, default="global", choices=["global", "patch"])
@@ -428,6 +550,12 @@ def main():
     args = make_parser().parse_args()
     args = load_config_into_args(args)
 
+    # Auto-derive checkpoint subdir from config name to avoid collisions
+    if args.config and args.checkpoint_dir == "checkpoints":
+        config_name = os.path.splitext(os.path.basename(args.config))[0]
+        args.checkpoint_dir = os.path.join("checkpoints", config_name)
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+
     device = torch.device(args.device if args.device else
                           ("cuda" if torch.cuda.is_available() else
                            "mps" if torch.backends.mps.is_available() else "cpu"))
@@ -447,9 +575,13 @@ def main():
 
     # ---- Eval dataset for FID ----
     eval_dataset = None
+    print(f"[fid] fid_every={args.fid_every}, FID_AVAILABLE={FID_AVAILABLE}")
     if args.fid_every > 0:
         eval_dataset = EvalDataset(args.metadata_csv, args.image_dir,
                                    split="test", image_size=args.image_size)
+        print(f"[fid] Loaded eval dataset: {len(eval_dataset)} samples")
+    else:
+        print("[fid] FID disabled (fid_every=0)")
 
     # ---- Transition table ----
     plate_targets, plate_weights = build_transition_table(image_bank, args.homeo_weight)
@@ -788,37 +920,14 @@ def main():
 
         # ============ Visualization ============
         if step % args.vis_every == 0 and step > 0:
-            G.eval()
-            fig_pool = plot_pool_samples(pool, id2label, step)
-            n = min(8, args.batch_size)
-
-            # Build per-sample task labels: homeo / forward / recovery
-            vis_titles = []
-            for i in range(n):
-                src = id2label.get(pool_labels[i].item(), "?")
-                tgt = id2label.get(target_labels[i].item(), "?")
-                dose_str = f"d={target_doses[i].item():.2g}" if target_doses[i].item() > 0 else ""
-                if is_homeo[i]:
-                    task = "homeo"
-                elif pool_labels[i].item() == 0:  # DMSO → drug
-                    task = "fwd"
-                else:  # drug → DMSO
-                    task = "rev"
-                vis_titles.append(f"{task}: {src}→{tgt} {dose_str}".strip())
-
-            fig_gen = plot_image_grid(
-                [fake_img[i, :3].detach() for i in range(n)],
-                vis_titles[:n],
-                f"Generated (step {step})",
+            vis_model = G_ema.module if G_ema is not None else G
+            vis_figs = vis_petridish(
+                vis_model, image_bank, id2label, device, step,
+                n_steps=T, img_channels=img_channels,
+                hidden_channels=args.hidden_channels,
             )
-            fig_real = plot_image_grid(
-                [real_img[i, :3] for i in range(n)],
-                vis_titles[:n],
-                f"Real targets (step {step})",
-            )
-            wandb_dict["vis/pool_states"] = wandb.Image(fig_pool) if use_wandb else None
-            wandb_dict["vis/generated"] = wandb.Image(fig_gen) if use_wandb else None
-            wandb_dict["vis/real_targets"] = wandb.Image(fig_real) if use_wandb else None
+            for k, fig in vis_figs.items():
+                wandb_dict[k] = wandb.Image(fig) if use_wandb else None
             plt.close("all")
             G.train()
 
