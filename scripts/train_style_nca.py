@@ -836,7 +836,7 @@ def train(args):
                 downsample=args.encoder_downsample)
             with autocast():
                 z_hat = E(aug_fake)
-            sty_loss = F.l1_loss(z_hat, z_g.detach())
+            sty_loss = F.mse_loss(z_hat, z_g.detach())
             total_loss = total_loss + args.style_weight * sty_loss
             accum_style = sty_loss.item()
 
