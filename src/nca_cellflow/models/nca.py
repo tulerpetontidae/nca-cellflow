@@ -11,6 +11,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .impa import ResBlk
+
 
 class Permute(nn.Module):
     """Simple module to permute tensor dimensions."""
@@ -574,5 +576,63 @@ class NCAStyleEncoder(nn.Module):
 
     def forward(self, x):
         h = self.backbone(x)
+        h = h.reshape(h.shape[0], -1)
+        return self.fc(h)
+
+
+# ============================================================================
+# ResBlk Style Encoder: probe-calibrated larger encoder for style-NCA
+# ============================================================================
+
+
+class ResBlkStyleEncoder(nn.Module):
+    """
+    ResBlk-based style encoder for self-supervised NCA training.
+
+    Uses the same ResBlk architecture as IMPAStyleEncoder / StyleEncoderClassifier
+    (proven in probe experiments to have strong representational capacity).
+    Outputs a z_dim style vector that conditions NCA dynamics via FiLM.
+
+    Default configuration (base=128, depth=4) matches the probe-calibrated
+    ``probe-s-w128-d4`` architecture.
+
+    Architecture:
+        Conv2d(in_channels -> base_channels, 3x3)
+        -> ResBlk(downsample=True) x num_downsamples
+        -> LeakyReLU -> AdaptiveAvgPool2d(1) -> LeakyReLU
+        -> Linear(last_channels -> z_dim)
+
+    Args:
+        in_channels: Number of input image channels.
+        base_channels: Initial channel width.
+        num_downsamples: Number of downsampling ResBlk stages.
+        max_channels: Channel cap.
+        z_dim: Output style vector dimension.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 3,
+        base_channels: int = 128,
+        num_downsamples: int = 4,
+        max_channels: int = 512,
+        z_dim: int = 32,
+    ):
+        super().__init__()
+        blocks: list[nn.Module] = [nn.Conv2d(in_channels, base_channels, 3, 1, 1)]
+        dim_in = base_channels
+        dim_out = base_channels
+        for _ in range(num_downsamples):
+            dim_out = min(dim_in * 2, max_channels)
+            blocks.append(ResBlk(dim_in, dim_out, downsample=True))
+            dim_in = dim_out
+        blocks.append(nn.LeakyReLU(0.2))
+        blocks.append(nn.AdaptiveAvgPool2d(1))
+        blocks.append(nn.LeakyReLU(0.2))
+        self.conv = nn.Sequential(*blocks)
+        self.fc = nn.Linear(dim_out, z_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.conv(x)
         h = h.reshape(h.shape[0], -1)
         return self.fc(h)

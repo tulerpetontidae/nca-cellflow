@@ -1,0 +1,56 @@
+# LatentNCA, hidden_channels=12 + bigger D (base_channels 48, blocks 3) + EMA, 30 NCA steps, step_size=0.08, plate matching, Morgan FP conditioning, balanced compound sampling, tanh dx clipping, large batch (128), 160k iters
+# Two-axis combined test: hidden12 + bigD on top of the ss008+tanh latent base.
+# If both single-axis ablations (hidden12, bigD) help individually, this should be additive.
+# Base: latent-hidden6-ema-steps30-v2-ss008-plate-fp-balanced-tanh-lb (rank 9, FID best 13.11)
+
+# data
+metadata_csv: /oak/stanford/groups/ccurtis2/users/alomakin/projects/nca-cellflow/data/bbbc021_six/metadata/bbbc021_df_all.csv
+image_dir: /oak/stanford/groups/ccurtis2/users/alomakin/projects/nca-cellflow/data/bbbc021_six
+image_size: 48
+plate_match: true
+balanced_cpd: true
+
+# model
+nca_type: latent
+z_dim: 16
+nca_hidden_dim: 128
+nca_cond_dim: 32
+cond_type: fingerprint
+fp_path: /oak/stanford/groups/ccurtis2/users/alomakin/projects/nca-cellflow/data/bbbc021_six/metadata/emb_morgan_fp.csv
+hidden_channels: 12
+fire_rate: 1.0
+nca_steps: 30
+step_size: 0.08
+use_tanh: true
+
+# discriminator (bigD: width 32->48, blocks 2->3)
+d_stages: 3
+d_base_channels: 48
+d_blocks: 3
+d_cardinality: 4
+d_expansion: 2
+d_kernel_size: 3
+d_embed_dim: 32
+
+# training
+batch_size: 128
+iterations: 160000
+lr_g: 0.0002
+lr_d: 0.0002
+beta1: 0.0
+beta2: 0.99
+gamma: 1.0
+grad_clip: 1.0
+ema_decay: 0.999
+ema_warmup_steps: 1000
+
+# misc
+num_workers: 8
+save_every: 5000
+vis_every: 1000
+fid_every: 5000
+fid_trajectory_every: 5000
+val_fid: true
+grad_diag_every: 1000
+checkpoint_dir: /oak/stanford/groups/ccurtis2/users/alomakin/projects/nca-cellflow/checkpoints/latent-hidden12-ema-steps30-v2-ss008-plate-fp-balanced-tanh-bigD-lb
+wandb_project: nca-cellflow

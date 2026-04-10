@@ -1,0 +1,58 @@
+# Style-NCA + replay pool for homeostasis
+# Tests: can NCA maintain z-phenotype stably over 4 cycles of 30 steps (120 total)?
+# Base: style-hidden12-ema-steps30-ss008-tanh-bigD-base-lb + use_pool
+
+# data
+image_size: 48
+
+# NCA
+z_dim: 32
+nca_hidden_dim: 128
+nca_cond_dim: 4
+hidden_channels: 12
+fire_rate: 1.0
+nca_steps: 30
+step_size: 0.08
+use_tanh: true
+
+# style encoder
+s_base_channels: 128
+s_num_downsamples: 4
+s_max_channels: 512
+
+# discriminator (bigD, unconditional)
+d_stages: 3
+d_base_channels: 48
+d_blocks: 3
+d_cardinality: 4
+d_expansion: 2
+d_kernel_size: 3
+
+# losses
+style_weight: 1.0
+intermediate_weight: 0.0
+
+# pool
+use_pool: true
+pool_size: 2024
+pool_recycle_every: 50
+pool_recycle_threshold: 4
+
+# training
+batch_size: 128
+iterations: 160000
+lr_g: 0.0002
+lr_d: 0.0002
+beta1: 0.0
+beta2: 0.99
+gamma: 1.0
+grad_clip: 1.0
+ema_decay: 0.999
+ema_warmup_steps: 1000
+
+# misc
+num_workers: 8
+save_every: 5000
+vis_every: 1000
+fid_every: 5000
+wandb_project: nca-cellflow-homeostasis

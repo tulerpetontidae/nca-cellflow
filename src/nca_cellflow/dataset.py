@@ -192,6 +192,90 @@ class IMPADataset(Dataset):
         return img
 
 
+class ClassificationDataset(Dataset):
+    """Treated-only compound classification dataset for capacity probing.
+
+    Returns ``(img, cpd_id)`` for each treated image. Designed for decoupled
+    calibration of D/StyleEncoder architectures as plain 34-class classifiers
+    — no ctrl, no pair sampling.
+
+    The compound label space is built from the **train split** regardless of
+    which split this instance serves, so train and val share identical ids.
+
+    Args:
+        metadata_csv: Path to ``bbbc021_df_all.csv``.
+        image_dir: Root image directory.
+        split: "train" or "test".
+        image_size: Target spatial size.
+        balanced_cpd: If True, ``__getitem__`` samples a compound uniformly
+            and then picks a random treated image from that compound. Used
+            for training so rare compounds aren't starved.
+        iter_all: If True, ``__getitem__(idx)`` returns the idx-th treated
+            image deterministically and ``__len__`` is the number of treated
+            images. Used for eval. Mutually exclusive with ``balanced_cpd``.
+        augment: If True, apply dither + horizontal/vertical flips (matches
+            ``IMPADataset._load``).
+    """
+
+    def __init__(self, metadata_csv: str, image_dir: str, split: str = "train",
+                 image_size: int = 48, balanced_cpd: bool = True,
+                 iter_all: bool = False, augment: bool = True):
+        if balanced_cpd and iter_all:
+            raise ValueError("balanced_cpd and iter_all are mutually exclusive")
+
+        df = pd.read_csv(metadata_csv, index_col=0)
+        df_trt = df[df["STATE"] == 1]
+
+        # Label space is derived from the TRAIN split so train/val align.
+        df_trt_train = df_trt[df_trt["SPLIT"] == "train"]
+        cpds_sorted = sorted(set(df_trt_train["CPD_NAME"].values))
+        self.cpd2id = {c: i for i, c in enumerate(cpds_sorted)}
+        self.id2cpd = {i: c for c, i in self.cpd2id.items()}
+        self.num_classes = len(self.cpd2id)
+
+        # Now filter to the requested split for actual sampling.
+        df_split = df_trt[df_trt["SPLIT"] == split]
+        self.trt_keys = df_split["SAMPLE_KEY"].values
+        self.trt_cpd = df_split["CPD_NAME"].values
+        # Any compound in this split that wasn't in train (shouldn't happen
+        # in BBBC021, but guard anyway) is dropped.
+        keep = np.array([c in self.cpd2id for c in self.trt_cpd])
+        self.trt_keys = self.trt_keys[keep]
+        self.trt_cpd = self.trt_cpd[keep]
+
+        if balanced_cpd:
+            self._cpd_to_trt_idx: dict[str, list[int]] = {}
+            for i, cpd in enumerate(self.trt_cpd):
+                self._cpd_to_trt_idx.setdefault(cpd, []).append(i)
+            # Only iterate over compounds that actually appear in this split.
+            self._cpd_list = sorted(self._cpd_to_trt_idx.keys())
+
+        self.image_dir = Path(image_dir)
+        self.image_size = image_size
+        self.balanced_cpd = balanced_cpd
+        self.iter_all = iter_all
+        self.augment = augment
+
+    def __len__(self):
+        return len(self.trt_keys)
+
+    def __getitem__(self, idx):
+        if self.balanced_cpd:
+            cpd = self._cpd_list[np.random.randint(len(self._cpd_list))]
+            pool = self._cpd_to_trt_idx[cpd]
+            j = pool[np.random.randint(len(pool))]
+        else:
+            # iter_all or plain index iteration
+            j = idx
+
+        img = self._load(self.trt_keys[j])
+        cpd_id = self.cpd2id[self.trt_cpd[j]]
+        return img, cpd_id
+
+    def _load(self, key: str) -> torch.Tensor:
+        return _load_image(self.image_dir, key, self.image_size, augment=self.augment)
+
+
 class EvalDataset(Dataset):
     """Deterministic dataset for FID evaluation.
 
@@ -249,6 +333,49 @@ class EvalDataset(Dataset):
 
     def _load(self, key: str) -> torch.Tensor:
         return _load_image(self.image_dir, key, self.image_size, augment=False)
+
+
+class CtrlPairDataset(Dataset):
+    """Ctrl-only dataset returning pairs of ctrl images for self-supervised NCA.
+
+    Returns (img_input, img_ref) where both are ctrl (DMSO) images.
+    img_input serves as NCA input, img_ref as style reference for encoding z.
+    Also usable for FID evaluation with augment=False and deterministic_ref=True.
+
+    Args:
+        metadata_csv: Path to bbbc021_df_all.csv.
+        image_dir: Root image directory.
+        split: "train" or "test".
+        image_size: Target spatial size.
+        augment: Apply dither + flips (True for training, False for eval).
+        deterministic_ref: If True, reference is deterministic by index
+            (shifted by half the dataset) for reproducible evaluation.
+    """
+
+    def __init__(self, metadata_csv: str, image_dir: str, split: str = "train",
+                 image_size: int = 96, augment: bool = True,
+                 deterministic_ref: bool = False):
+        df = pd.read_csv(metadata_csv, index_col=0)
+        df = df[(df["SPLIT"] == split) & (df["STATE"] == 0)]
+        self.ctrl_keys = df["SAMPLE_KEY"].values
+        self.image_dir = Path(image_dir)
+        self.image_size = image_size
+        self.augment = augment
+        self.deterministic_ref = deterministic_ref
+
+    def __len__(self):
+        return len(self.ctrl_keys)
+
+    def __getitem__(self, idx):
+        img_input = _load_image(self.image_dir, self.ctrl_keys[idx],
+                                self.image_size, augment=self.augment)
+        if self.deterministic_ref:
+            ref_idx = (idx + len(self.ctrl_keys) // 2) % len(self.ctrl_keys)
+        else:
+            ref_idx = np.random.randint(len(self.ctrl_keys))
+        img_ref = _load_image(self.image_dir, self.ctrl_keys[ref_idx],
+                              self.image_size, augment=self.augment)
+        return img_input, img_ref
 
 
 class LabeledImageBank:

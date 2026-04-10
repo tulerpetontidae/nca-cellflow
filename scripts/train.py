@@ -34,7 +34,7 @@ except ImportError:
     FID_AVAILABLE = False
     print("[warn] torchmetrics not installed — FID evaluation disabled")
 
-from nca_cellflow import IMPADataset, EvalDataset
+from nca_cellflow import IMPADataset, EvalDataset, compute_texture_stats
 from nca_cellflow.models import BaseNCA, NoiseNCA, LatentNCA, NCAStyleEncoder, Discriminator, PatchDiscriminator, TextureDiscriminator, SpectralMatchingLoss
 
 
@@ -344,7 +344,7 @@ def compute_fid(G, eval_dataset, device, args, id2cpd, img_channels, cond_fn=lam
         per_cpd_fake = defaultdict(list)
 
         G.eval()
-        for img_ctrl, img_trt, cpd_id in loader:
+        for img_ctrl, img_trt, cpd_id, _dose in loader:
             img_ctrl = img_ctrl.to(device)
             img_trt = img_trt.to(device)
             cpd_id = cpd_id.to(device)
@@ -451,7 +451,7 @@ def compute_fid_trajectory(G, eval_dataset, device, args, img_channels, cond_fn=
 
         # Step 1: compute real stats once, feeding directly to FID (no storage)
         _traj_fid.reset()
-        for img_ctrl, img_trt, cpd_id in loader:
+        for img_ctrl, img_trt, cpd_id, _dose in loader:
             for img in [img_ctrl, img_trt]:
                 img_01 = (img.clamp(-1, 1) + 1) / 2
                 img_01 = torch.floor(img_01 * 255).float() / 255.0
@@ -469,7 +469,7 @@ def compute_fid_trajectory(G, eval_dataset, device, args, img_channels, cond_fn=
             _traj_fid.real_features_cov_sum.copy_(real_cov)
             _traj_fid.real_features_num_samples.copy_(real_n)
 
-            for img_ctrl, img_trt, cpd_id in loader:
+            for img_ctrl, img_trt, cpd_id, _dose in loader:
                 img_ctrl = img_ctrl.to(device)
                 cpd_id = cpd_id.to(device)
 
@@ -511,108 +511,6 @@ def compute_fid_trajectory(G, eval_dataset, device, args, img_channels, cond_fn=
         G.train()
         torch.cuda.empty_cache()
         return None
-
-
-# ---------------------------------------------------------------------------
-# Texture quality metrics
-# ---------------------------------------------------------------------------
-
-def _radial_profile(mag: torch.Tensor) -> torch.Tensor:
-    """Azimuthally average a 2D magnitude tensor [H, W] → [max_radius]."""
-    H, W = mag.shape
-    cy, cx = H // 2, W // 2
-    max_r = min(cy, cx)
-    y, x = torch.meshgrid(torch.arange(H, device=mag.device),
-                           torch.arange(W, device=mag.device), indexing="ij")
-    r = torch.sqrt((y - cy).float() ** 2 + (x - cx).float() ** 2).long().clamp(max=max_r - 1)
-    profile = torch.zeros(max_r, device=mag.device)
-    counts = torch.zeros(max_r, device=mag.device)
-    profile.scatter_add_(0, r.reshape(-1), mag.reshape(-1))
-    counts.scatter_add_(0, r.reshape(-1), torch.ones_like(mag.reshape(-1)))
-    return profile / counts.clamp(min=1)
-
-
-@torch.no_grad()
-def compute_texture_stats(real_imgs: torch.Tensor, fake_imgs: torch.Tensor) -> dict:
-    """
-    Compute texture quality metrics comparing real and fake image batches.
-
-    Returns dict with:
-        spectrum_ratio_high: mean(P_fake/P_real) for top-quarter frequencies (< 1 = blurry)
-        spectrum_ratio_low:  mean(P_fake/P_real) for bottom-quarter frequencies
-        hf_energy_real: fraction of spectral energy in high frequencies (real)
-        hf_energy_fake: fraction of spectral energy in high frequencies (fake)
-        laplacian_var_real: mean Laplacian variance (real)
-        laplacian_var_fake: mean Laplacian variance (fake)
-        laplacian_ratio: fake / real (< 1 = blurry)
-    """
-    device = real_imgs.device
-
-    # --- Radial power spectrum ---
-    # Use full 2D FFT, shift DC to center, average across batch & channels
-    def mean_spectrum(imgs):
-        f = torch.fft.fft2(imgs)
-        f = torch.fft.fftshift(f, dim=(-2, -1))
-        mag = torch.log1p(f.abs())  # log-magnitude
-        return mag.mean(dim=(0, 1))  # average over batch and channels → [H, W]
-
-    spec_real = mean_spectrum(real_imgs)
-    spec_fake = mean_spectrum(fake_imgs)
-    profile_real = _radial_profile(spec_real)
-    profile_fake = _radial_profile(spec_fake)
-
-    max_r = profile_real.shape[0]
-    quarter = max_r // 4
-    ratio = profile_fake / profile_real.clamp(min=1e-6)
-    spectrum_ratio_low = ratio[:quarter].mean().item()
-    spectrum_ratio_high = ratio[-quarter:].mean().item()
-
-    # --- High-frequency energy fraction ---
-    def hf_energy_frac(imgs):
-        f = torch.fft.rfft2(imgs)
-        power = (f.abs() ** 2).mean(dim=(0, 1))  # [H, W//2+1]
-        H = power.shape[0]
-        total = power.sum()
-        # High freq = outer half of frequency space
-        hf_mask = torch.zeros_like(power, dtype=torch.bool)
-        cy = H // 2
-        cx = power.shape[1]  # rfft: only positive freqs
-        y = torch.arange(H, device=device)
-        x = torch.arange(cx, device=device)
-        yy, xx = torch.meshgrid(y, x, indexing="ij")
-        # Wrap y freqs: shift so DC is at center
-        yy_shift = torch.where(yy > cy, H - yy, yy)
-        r = torch.sqrt(yy_shift.float() ** 2 + xx.float() ** 2)
-        cutoff = min(cy, cx) / 2
-        hf_mask = r > cutoff
-        return (power[hf_mask].sum() / total.clamp(min=1e-8)).item()
-
-    hf_real = hf_energy_frac(real_imgs)
-    hf_fake = hf_energy_frac(fake_imgs)
-
-    # --- Laplacian variance (sharpness) ---
-    laplacian_kernel = torch.tensor(
-        [[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=torch.float32, device=device
-    ).reshape(1, 1, 3, 3).expand(real_imgs.shape[1], -1, -1, -1)
-
-    def lap_var(imgs):
-        lap = F.conv2d(imgs, laplacian_kernel, padding=1, groups=imgs.shape[1])
-        # Per-image variance, then mean across batch
-        return lap.var(dim=(-2, -1)).mean().item()
-
-    lap_real = lap_var(real_imgs)
-    lap_fake = lap_var(fake_imgs)
-
-    return {
-        "texture/spectrum_ratio_high": spectrum_ratio_high,
-        "texture/spectrum_ratio_low": spectrum_ratio_low,
-        "texture/hf_energy_real": hf_real,
-        "texture/hf_energy_fake": hf_fake,
-        "texture/hf_energy_ratio": hf_fake / max(hf_real, 1e-8),
-        "texture/laplacian_var_real": lap_real,
-        "texture/laplacian_var_fake": lap_fake,
-        "texture/laplacian_ratio": lap_fake / max(lap_real, 1e-8),
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -715,6 +613,10 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--style_weight", type=float, default=0.0,
                    help="Weight for style reconstruction loss (LatentNCA only, 0 = disabled). "
                         "Trains a StyleEncoder to recover the style from the generated image.")
+    p.add_argument("--style_predict_z_only", action="store_true", default=False,
+                   help="If set, the StyleEncoder predicts only z (Q-head / InfoGAN-style) "
+                        "instead of the full [embed||(dose)||z]. Avoids the encoder bottleneck "
+                        "on hard-to-discriminate classes.")
     p.add_argument("--accumulate_steps", type=int, default=1,
                    help="Gradient accumulation steps (effective batch = batch_size * accumulate_steps)")
     p.add_argument("--ema_decay", type=float, default=0.0,
@@ -956,8 +858,17 @@ def train(args):
     use_style = args.style_weight > 0 and args.nca_type == "latent"
     S = None
     if use_style:
+        # Q-head mode: predict only z (16-dim). Default: predict full [embed||(dose)||z].
+        # The full-prediction mode behaves badly on FID_c when classes are hard to
+        # discriminate (e.g. 34 BBBC021 compounds) — see Discussion in
+        # figures/experiments_summary.md. Q-head mode strips the embed-prediction
+        # subspace from the loss and only enforces z usage.
+        if args.style_predict_z_only:
+            style_dim = args.z_dim
+        else:
+            style_dim = args.nca_cond_dim + args.z_dim
         S = NCAStyleEncoder(
-            in_channels=img_channels, style_dim=args.nca_cond_dim + args.z_dim,
+            in_channels=img_channels, style_dim=style_dim,
             base_channels=64,
         ).to(device)
 
@@ -1131,17 +1042,25 @@ def train(args):
 
             # --- Null class D on actual intermediate (for intermediate and/or gradual) ---
             if use_intermediate or use_gradual:
-                real_null = torch.cat([nca_input[:, :img_channels], img_trt], dim=0)
+                # real_null uses half ctrl + half trt (batch B, not the full 2B
+                # concatenation). inter_img is fed through at batch B — no repeat.
+                # Relativistic loss uses per-side .mean() so batch sizes don't need
+                # to match; the previous `cat(ctrl, trt) + inter.repeat(2)` pattern
+                # was paying ~2x compute on the inter path for no math reason.
+                B = nca_input.shape[0]
+                half = B // 2
+                real_null = torch.cat(
+                    [nca_input[:half, :img_channels], img_trt[:half]], dim=0,
+                )
                 null_ids = torch.full(
                     (real_null.shape[0],), null_class_id, device=device, dtype=torch.long,
                 )
-                inter_dup = inter_img.repeat(2, 1, 1, 1)
                 inter_null_ids = torch.full(
-                    (inter_dup.shape[0],), null_class_id, device=device, dtype=torch.long,
+                    (inter_img.shape[0],), null_class_id, device=device, dtype=torch.long,
                 )
 
                 real_null_req = real_null.detach().requires_grad_(True)
-                inter_req = inter_dup.detach().requires_grad_(True)
+                inter_req = inter_img.detach().requires_grad_(True)
 
                 with autocast():
                     d_real_null = D(real_null_req, null_ids)
@@ -1187,7 +1106,9 @@ def train(args):
             style_target = None
             z_sample = None
             if use_style:
-                style_target, z_sample = G._prepare_cond(cond_fn(cpd_id))
+                cond_z_full, z_sample = G._prepare_cond(cond_fn(cpd_id))
+                # Q-head mode: target is just z (16-dim). Otherwise full [embed||(dose)||z].
+                style_target = z_sample if args.style_predict_z_only else cond_z_full
 
             # Extra kwargs for LatentNCA (pass z to reuse same sample)
             z_kwargs = {"z": z_sample} if z_sample is not None else {}
@@ -1221,18 +1142,24 @@ def train(args):
             # --- Intermediate G loss (null class) ---
             g_inter_loss_val = 0.0
             if use_intermediate:
-                real_null = torch.cat([nca_input[:, :img_channels], img_trt], dim=0)
+                # Same halved-batch formulation as in the D step (see comment there).
+                # inter_img flows through at batch B without duplication; real_null
+                # is half ctrl + half trt at batch B.
+                B = nca_input.shape[0]
+                half = B // 2
+                real_null = torch.cat(
+                    [nca_input[:half, :img_channels], img_trt[:half]], dim=0,
+                )
                 null_ids = torch.full(
                     (real_null.shape[0],), null_class_id, device=device, dtype=torch.long,
                 )
-                inter_dup = inter_img.repeat(2, 1, 1, 1)
                 inter_null_ids = torch.full(
-                    (inter_dup.shape[0],), null_class_id, device=device, dtype=torch.long,
+                    (inter_img.shape[0],), null_class_id, device=device, dtype=torch.long,
                 )
 
                 with autocast():
                     d_real_null = D(real_null.detach(), null_ids)
-                    d_inter = D(inter_dup, inter_null_ids)
+                    d_inter = D(inter_img, inter_null_ids)
                 if isinstance(d_inter, dict):
                     g_inter_adv = 0.0
                     for key in d_inter:
@@ -1252,21 +1179,26 @@ def train(args):
                 alpha = (t_inter_g + 1) / args.nca_steps
 
                 # Target class: intermediate vs trt
-                # Null class: intermediate vs all cells (ctrl + trt)
-                real_all = torch.cat([nca_input[:, :img_channels], img_trt], dim=0)
+                # Null class: intermediate vs half ctrl + half trt (batch B).
+                # Previously used cat(ctrl, trt) at 2B + inter.repeat(2) at 2B;
+                # the halved batch matches the new -inter-lb formulation.
+                B = nca_input.shape[0]
+                half = B // 2
+                real_all = torch.cat(
+                    [nca_input[:half, :img_channels], img_trt[:half]], dim=0,
+                )
                 null_ids = torch.full(
                     (real_all.shape[0],), null_class_id, device=device, dtype=torch.long,
                 )
-                inter_dup = inter_img.repeat(2, 1, 1, 1)
                 null_ids_fake = torch.full(
-                    (inter_dup.shape[0],), null_class_id, device=device, dtype=torch.long,
+                    (inter_img.shape[0],), null_class_id, device=device, dtype=torch.long,
                 )
 
                 with autocast():
                     d_real_tgt = D(img_trt.detach(), cpd_id)
                     d_fake_tgt = D(inter_img, cpd_id)
                     d_real_null = D(real_all.detach(), null_ids)
-                    d_fake_null = D(inter_dup, null_ids_fake)
+                    d_fake_null = D(inter_img, null_ids_fake)
 
                 def _rel_g(d_fake, d_real):
                     if isinstance(d_fake, dict):
@@ -1461,9 +1393,12 @@ def train(args):
                     fid_vals = []
                     for cpd_name, fid_val in fid_per_cpd.items():
                         eval_log[f"fid/cpd/{cpd_name}"] = fid_val
+                        logs[f"fid/cpd/{cpd_name}"].append(fid_val)
                         fid_vals.append(fid_val)
                     if fid_vals:
-                        eval_log["fid/mean_per_cpd"] = np.mean(fid_vals)
+                        mean_per_cpd = float(np.mean(fid_vals))
+                        eval_log["fid/mean_per_cpd"] = mean_per_cpd
+                        logs["fid/mean_per_cpd"].append(mean_per_cpd)
                     logs["fid/global"].append(fid_global)
 
             if use_wandb and eval_log:
@@ -1531,6 +1466,7 @@ def train(args):
                     "intermediate_weight": args.intermediate_weight,
                     "gradual_weight": args.gradual_weight,
                     "style_weight": args.style_weight,
+                    "style_predict_z_only": args.style_predict_z_only,
                     "S_state": S.state_dict() if S is not None else None,
                     "D_tex_state": D_tex.state_dict() if D_tex is not None else None,
                     "texture_d": args.texture_d,

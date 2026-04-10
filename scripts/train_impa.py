@@ -44,7 +44,7 @@ except ImportError:
     FID_AVAILABLE = False
     print("[warn] torchmetrics not installed — FID evaluation disabled")
 
-from nca_cellflow import IMPADataset, EvalDataset
+from nca_cellflow import IMPADataset, EvalDataset, compute_texture_stats
 from nca_cellflow.models.impa import (
     IMPAGenerator, IMPAMappingNetwork, IMPAStyleEncoder, IMPADiscriminator, he_init,
 )
@@ -269,7 +269,7 @@ def compute_fid(G, M, eval_dataset, device, args, id2cpd, fp_matrix):
 
         G.eval()
         M.eval()
-        for img_ctrl, img_trt, cpd_id in loader:
+        for img_ctrl, img_trt, cpd_id, _dose in loader:
             img_ctrl = img_ctrl.to(device)
             img_trt = img_trt.to(device)
             cpd_id = cpd_id.to(device)
@@ -681,23 +681,45 @@ def train(args):
                 x_fake[:, :3], img_ctrl, img_trt, cpd_id, step + 1, use_wandb,
             )
 
-        # ============== FID (test split) ==============
-        if args.fid_every > 0 and (step + 1) % args.fid_every == 0 and eval_dataset is not None:
-            fid_global, fid_per_cpd = compute_fid(
-                G, M, eval_dataset, device, args, id2cpd, fp_matrix,
-            )
-            if fid_global is not None:
-                fid_log = {"fid/global": fid_global}
-                fid_vals = []
-                for cpd_name, fid_val in fid_per_cpd.items():
-                    fid_log[f"fid/cpd/{cpd_name}"] = fid_val
-                    fid_vals.append(fid_val)
-                if fid_vals:
-                    fid_log["fid/mean_per_cpd"] = np.mean(fid_vals)
-                print(f"[FID] global={fid_global:.2f}  mean_per_cpd={np.mean(fid_vals):.2f}")
-                if use_wandb:
-                    wandb.log(fid_log, step=step + 1)
-                logs["fid/global"].append(fid_global)
+        # ============== Evaluation metrics (texture stats + FID) ==============
+        if args.fid_every > 0 and (step + 1) % args.fid_every == 0:
+            eval_log = {}
+
+            # --- Texture quality stats (re-run forward in eval mode on last training batch) ---
+            G.eval(); M.eval()
+            try:
+                with torch.no_grad():
+                    fp_tex = fp_matrix[cpd_id]
+                    z_tex = torch.randn(img_ctrl.shape[0], args.z_dimension, device=device)
+                    s_tex = M(torch.cat([fp_tex, z_tex], dim=1))
+                    _, tex_fake = G(img_ctrl, s_tex)
+                    tex_fake_rgb = tex_fake[:, :3].contiguous()
+                tex_stats = compute_texture_stats(img_trt[:, :3], tex_fake_rgb)
+                eval_log.update(tex_stats)
+                for k, v in tex_stats.items():
+                    logs[k].append(v)
+            except Exception as e:
+                print(f"[warn] texture stats failed: {e}")
+            G.train(); M.train()
+
+            # --- FID (test split) ---
+            if eval_dataset is not None:
+                fid_global, fid_per_cpd = compute_fid(
+                    G, M, eval_dataset, device, args, id2cpd, fp_matrix,
+                )
+                if fid_global is not None:
+                    eval_log["fid/global"] = fid_global
+                    fid_vals = []
+                    for cpd_name, fid_val in fid_per_cpd.items():
+                        eval_log[f"fid/cpd/{cpd_name}"] = fid_val
+                        fid_vals.append(fid_val)
+                    if fid_vals:
+                        eval_log["fid/mean_per_cpd"] = np.mean(fid_vals)
+                    print(f"[FID] global={fid_global:.2f}  mean_per_cpd={np.mean(fid_vals):.2f}")
+                    logs["fid/global"].append(fid_global)
+
+            if use_wandb and eval_log:
+                wandb.log(eval_log, step=step + 1)
 
         # ============== Checkpointing ==============
         is_save_step = (step + 1) % args.save_every == 0

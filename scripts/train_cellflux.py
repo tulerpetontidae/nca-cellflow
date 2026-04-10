@@ -37,7 +37,7 @@ except ImportError:
     FID_AVAILABLE = False
     print("[warn] torchmetrics not installed — FID evaluation disabled")
 
-from nca_cellflow import IMPADataset, EvalDataset
+from nca_cellflow import IMPADataset, EvalDataset, compute_texture_stats
 from nca_cellflow.models.cellflux_unet import (
     CellFluxUNet, ode_sample_heun, ode_sample_midpoint, ode_sample_euler,
     edm_time_grid, skewed_timestep_sample,
@@ -133,8 +133,9 @@ def load_checkpoint(path, model, optimizer=None, ema=None, map_location=None):
         ema.load_state_dict(ckpt["ema_state"])
     logs = defaultdict(list, ckpt.get("logs", {}))
     step = ckpt.get("step", 0)
+    extra = ckpt.get("extra", None)
     print(f"[ckpt] loaded {path} at step {step}")
-    return step, logs
+    return step, logs, extra
 
 
 # ---------------------------------------------------------------------------
@@ -310,7 +311,9 @@ def log_visualizations(model, dataset, device, args, id2cpd, fp_matrix,
 
 _global_fid = None
 _cpd_fid = None
-_traj_fid = None
+# Module-level cache of FID objects so we don't reinstantiate the Inception
+# backbone on every trajectory eval. Keyed by the integer ODE grid index.
+_traj_fids: dict[int, "FrechetInceptionDistance"] | None = None
 
 
 @torch.no_grad()
@@ -318,99 +321,190 @@ def compute_fid_trajectory(model, eval_dataset, device, args, fp_matrix,
                            cfg_scale):
     """Compute FID at equidistant time points along the ODE trajectory.
 
-    Uses a uniform time grid t in [0, 1] with ~6 evaluation points.
-    At each eval time t_eval, runs a Heun ODE from t=0 to t=t_eval and
-    computes FID of the intermediate state against all real cells (ctrl + trt).
+    Uses a uniform time grid t in [0, 1] with ~6 evaluation points. Runs ONE
+    full-length Heun ODE per (batch, mode) and captures intermediate states at
+    each eval point during the pass — avoids the 6×-redundant re-ODE of the
+    previous implementation (≈3.5× speedup per mode in practice).
 
-    Returns dict {t_value: fid_value} or None on failure.
+    Supports two initial-state modes via `args.fid_trajectory_noise`:
+        'noisy' — x_0 = ctrl + N(0, noise_level)  (matches training conditions)
+        'clean' — x_0 = ctrl                       (deterministic measurement)
+        'both'  — compute both; returned keys are prefixed with mode name
+
+    Optional speed knobs (also from args):
+        --fid_trajectory_ode_steps     (default 50)  Heun step count per ODE
+        --fid_trajectory_max_samples   (default 0)   cap eval set via fixed stride
+
+    Return:
+        dict mapping key-suffix to FID value, where suffix is formatted so the
+        logging site can prepend 'fid_traj/'. For single 'noisy' mode the
+        suffix is 't_{t:.3f}' (backward compatible with existing wandb charts);
+        for 'clean' or 'both' it is '{mode}_t_{t:.3f}'.
     """
-    global _traj_fid
+    global _traj_fids
     if not FID_AVAILABLE:
         return None
 
     try:
-        if _traj_fid is None:
-            _traj_fid = FrechetInceptionDistance(normalize=True).to(device)
+        # --- Mode selection ---
+        noise_mode = getattr(args, "fid_trajectory_noise", "noisy")
+        if noise_mode == "both":
+            active_modes = ["noisy", "clean"]
+        elif noise_mode == "clean":
+            active_modes = ["clean"]
+        else:
+            active_modes = ["noisy"]
 
-        # ~6 equidistant eval points in t, always include 0 and 1
-        n_eval = 6
-        eval_times = torch.linspace(0.0, 1.0, n_eval + 1)[1:]  # skip t=0 (just noise)
-        eval_times = eval_times.tolist()  # [0.167, 0.333, 0.5, 0.667, 0.833, 1.0]
+        # --- Speed + reporting config ---
+        n_eval = int(getattr(args, "fid_trajectory_n_eval", 6) or 6)
+        n_ode_steps = int(getattr(args, "fid_trajectory_ode_steps", 50) or 50)
+        max_samples = int(getattr(args, "fid_trajectory_max_samples", 0) or 0)
+        naming = getattr(args, "fid_trajectory_naming", "time")
 
-        # Fine Heun grid for the full ODE (we stop at each eval point)
-        n_ode_steps = 50
         full_time_grid = torch.linspace(0.0, 1.0, n_ode_steps + 1, device=device)
+
+        # Build the eval-point table: list of (step_num, grid_idx, nominal_time).
+        # - grid_idx: ODE Heun step at which to capture the intermediate state.
+        # - nominal_time = grid_idx / n_ode_steps (fractional progress).
+        # - step_num: label used in wandb keys.
+        eval_points: list[tuple[int, int, float]] = []
+        if naming == "step":
+            # Mirror NCA's selection (scripts/train.py:432-441) so wandb 'step_K' keys
+            # collide 1:1 with NCA runs. step_num == grid_idx so 'step_6' here means
+            # the same ODE-grid position as NCA's 'step_6' (assuming n_ode_steps == nca_steps).
+            T = n_ode_steps
+            if T <= 6:
+                picked = list(range(1, T + 1))
+            else:
+                step_size = max(1, T // 5)
+                picked = list(range(step_size, T, step_size))
+                if T not in picked:
+                    picked.append(T)
+                if 1 not in picked:
+                    picked.insert(0, 1)
+            for idx in picked:
+                eval_points.append((idx, idx, idx / T))
+        else:
+            # 'time' naming: original behaviour, n_eval evenly-spaced fractional points.
+            # Dedupe on grid_idx so multiple eval points hitting the same grid step collapse
+            # to a single FID (preserves the FIRST step_num for that index).
+            seen_idx: set[int] = set()
+            for k in range(1, n_eval + 1):
+                nominal_t = k / n_eval
+                idx = int(round(nominal_t * n_ode_steps))
+                idx = max(1, min(idx, n_ode_steps))
+                if idx in seen_idx:
+                    continue
+                seen_idx.add(idx)
+                eval_points.append((k, idx, nominal_t))
+
+        eval_grid_indices = [idx for _, idx, _ in eval_points]
+        eval_idx_set = set(eval_grid_indices)
+
+        # --- Optional subsample the eval set ---
+        ds = eval_dataset
+        if max_samples > 0 and max_samples < len(eval_dataset):
+            from torch.utils.data import Subset
+            stride = max(1, len(eval_dataset) // max_samples)
+            sub_indices = list(range(0, len(eval_dataset), stride))[:max_samples]
+            ds = Subset(eval_dataset, sub_indices)
 
         traj_bs = min(args.batch_size, 64)
         loader = DataLoader(
-            eval_dataset, batch_size=traj_bs, shuffle=False,
+            ds, batch_size=traj_bs, shuffle=False,
             num_workers=0, pin_memory=False, drop_last=False,
         )
 
+        # --- (Re)create the FID object cache ---
+        # Use one FID per eval grid index; reused across modes (reset between them).
+        if _traj_fids is None or set(_traj_fids.keys()) != eval_idx_set:
+            _traj_fids = {
+                idx: FrechetInceptionDistance(normalize=True).to(device)
+                for idx in eval_grid_indices
+            }
+
         model.eval()
 
-        # Step 1: compute real stats once (ctrl + trt pooled)
-        _traj_fid.reset()
-        for img_ctrl, img_trt, cpd_id in loader:
-            for img in [img_ctrl, img_trt]:
+        # --- Compute real stats once (ctrl + trt pooled) ---
+        primary = _traj_fids[eval_grid_indices[0]]
+        primary.reset()
+        for img_ctrl, img_trt, cpd_id, _dose in loader:
+            for img in (img_ctrl, img_trt):
                 img_01 = (img.clamp(-1, 1) + 1) / 2
                 img_01 = torch.floor(img_01 * 255).float() / 255.0
-                _traj_fid.update(img_01.to(device), real=True)
-        real_mu = _traj_fid.real_features_sum.clone()
-        real_cov = _traj_fid.real_features_cov_sum.clone()
-        real_n = _traj_fid.real_features_num_samples.clone()
-        torch.cuda.empty_cache()
+                primary.update(img_01.to(device), real=True)
+        real_mu = primary.real_features_sum.clone()
+        real_cov = primary.real_features_cov_sum.clone()
+        real_n = primary.real_features_num_samples.clone()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-        # Precompute which ODE grid indices correspond to eval times
-        eval_grid_indices = []
-        for t_eval in eval_times:
-            # Find the closest grid point at or just past t_eval
-            idx = int(round(t_eval * n_ode_steps))
-            idx = max(1, min(idx, n_ode_steps))
-            eval_grid_indices.append(idx)
+        fid_traj: dict[str, float] = {}
 
-        # Step 2: for each batch, run ODE and capture intermediates
-        # Collect fake features at each eval point
-        fid_traj = {}
-        for t_idx, (t_eval, grid_idx) in enumerate(zip(eval_times, eval_grid_indices)):
-            _traj_fid.reset()
-            _traj_fid.real_features_sum.copy_(real_mu)
-            _traj_fid.real_features_cov_sum.copy_(real_cov)
-            _traj_fid.real_features_num_samples.copy_(real_n)
+        # --- One pass per mode. Within a mode, ONE ODE solve per batch. ---
+        for mode in active_modes:
+            # Reset all FIDs and seed real stats from the shared buffers
+            for f in _traj_fids.values():
+                f.reset()
+                f.real_features_sum.copy_(real_mu)
+                f.real_features_cov_sum.copy_(real_cov)
+                f.real_features_num_samples.copy_(real_n)
 
-            # ODE sub-grid from 0 to this eval point
-            sub_grid = full_time_grid[:grid_idx + 1]
-
-            for img_ctrl, img_trt, cpd_id in loader:
+            for img_ctrl, img_trt, cpd_id, _dose in loader:
                 img_ctrl = img_ctrl.to(device)
                 cpd_id = cpd_id.to(device)
                 cond = fp_matrix[cpd_id].to(device)
 
-                x = img_ctrl + torch.randn_like(img_ctrl) * args.noise_level
+                if mode == "noisy":
+                    x = img_ctrl + torch.randn_like(img_ctrl) * args.noise_level
+                else:  # clean
+                    x = img_ctrl.clone()
 
-                # Heun ODE up to this time point
-                for i in range(len(sub_grid) - 1):
-                    t_cur = sub_grid[i]
-                    t_next = sub_grid[i + 1]
+                # One full Heun ODE, streaming intermediates at the eval points
+                for i in range(n_ode_steps):
+                    t_cur = full_time_grid[i]
+                    t_next = full_time_grid[i + 1]
                     dt = t_next - t_cur
-                    t_batch = torch.full((x.shape[0],), t_cur.item(), device=device)
 
+                    t_batch = torch.full((x.shape[0],), t_cur.item(), device=device)
                     v1 = _eval_velocity_for_traj(model, x, t_batch, cond, cfg_scale)
                     x_euler = x + v1 * dt
                     t_batch_next = torch.full((x.shape[0],), t_next.item(), device=device)
                     v2 = _eval_velocity_for_traj(model, x_euler, t_batch_next, cond, cfg_scale)
                     x = x + 0.5 * dt * (v1 + v2)
 
-                rgb = x[:, :3].clamp(-1, 1)
-                rgb_01 = (rgb + 1) / 2
-                rgb_01 = torch.floor(rgb_01 * 255).float() / 255.0
-                _traj_fid.update(rgb_01, real=False)
+                    step_reached = i + 1
+                    if step_reached in eval_idx_set:
+                        rgb = x[:, :3].clamp(-1, 1)
+                        rgb_01 = (rgb + 1) / 2
+                        rgb_01 = torch.floor(rgb_01 * 255).float() / 255.0
+                        _traj_fids[step_reached].update(rgb_01, real=False)
 
-            try:
-                fid_traj[round(t_eval, 3)] = _traj_fid.compute().item()
-            except Exception:
-                pass
-            torch.cuda.empty_cache()
+            # Collect this mode's results. Iterate eval_points (not _traj_fids)
+            # so step_num is available for the 'step' naming and the ordering is
+            # deterministic (dict ordering is insertion-order in Python 3.7+ but
+            # this is clearer).
+            for step_num, idx, nominal_t in eval_points:
+                f = _traj_fids[idx]
+                if naming == "step":
+                    base = f"step_{step_num}"
+                else:  # time (backward compat)
+                    base = f"t_{nominal_t:.3f}"
+                # Symmetric rule: single-mode runs drop the mode prefix, regardless
+                # of which mode. This keeps clean-only runs' keys plain ('step_1',
+                # 't_0.167') so they plot on the same wandb axis as noisy-only and
+                # NCA runs. Multi-mode runs prefix with the mode to disambiguate.
+                if len(active_modes) == 1:
+                    suffix = base
+                else:
+                    suffix = f"{mode}_{base}"
+                try:
+                    fid_traj[suffix] = float(f.compute().item())
+                except Exception:
+                    pass
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         model.train()
         return fid_traj
@@ -418,7 +512,8 @@ def compute_fid_trajectory(model, eval_dataset, device, args, fp_matrix,
     except Exception as e:
         print(f"[warn] FID trajectory failed: {e}")
         model.train()
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         return None
 
 
@@ -463,7 +558,7 @@ def compute_fid(model, eval_dataset, device, args, id2cpd, fp_matrix,
         per_cpd_fake = defaultdict(list)
 
         model.eval()
-        for img_ctrl, img_trt, cpd_id in loader:
+        for img_ctrl, img_trt, cpd_id, _dose in loader:
             img_ctrl = img_ctrl.to(device)
             img_trt = img_trt.to(device)
             cpd_id = cpd_id.to(device)
@@ -582,6 +677,25 @@ def make_parser():
                    help="Compute FID every N steps (0 = disabled, uses all test treated images)")
     p.add_argument("--fid_trajectory_every", type=int, default=0,
                    help="Compute FID trajectory every N steps (0 = disabled)")
+    p.add_argument("--fid_trajectory_noise", type=str, default="noisy",
+                   choices=["noisy", "clean", "both"],
+                   help="Trajectory FID initial state mode: 'noisy' = ctrl + N(0,noise_level) "
+                        "(matches training, backward compat), 'clean' = ctrl only (deterministic), "
+                        "'both' = compute both and return separate keys.")
+    p.add_argument("--fid_trajectory_ode_steps", type=int, default=50,
+                   help="Number of Heun ODE steps for trajectory eval (lower = faster, noisier)")
+    p.add_argument("--fid_trajectory_max_samples", type=int, default=0,
+                   help="Cap on eval dataset size for trajectory FID (0 = use all). "
+                        "Subsampled deterministically via fixed stride; smaller = faster, noisier FID.")
+    p.add_argument("--fid_trajectory_n_eval", type=int, default=6,
+                   help="Number of trajectory eval points to report (default 6 matches the "
+                        "historical cellflux setting). Set to 30 to align 1:1 with NCA's step_N "
+                        "trajectory keys for same-axis wandb plotting.")
+    p.add_argument("--fid_trajectory_naming", type=str, default="time",
+                   choices=["time", "step"],
+                   help="Key format for trajectory FID: 'time' (default, backward compat) "
+                        "produces 't_0.167' etc; 'step' produces 'step_1..step_N' matching "
+                        "the NCA convention in train.py.")
     p.add_argument("--checkpoint_dir", type=str, default="checkpoints")
     p.add_argument("--resume", type=str, default=None)
     p.add_argument("--device", type=str, default=None)
@@ -724,9 +838,10 @@ def train(args):
     # ---- logging / resume ----
     logs = defaultdict(list)
     start_step = 0
+    extra = None
 
     if args.resume:
-        start_step, logs = load_checkpoint(
+        start_step, logs, extra = load_checkpoint(
             args.resume, model, optimizer, ema=ema, map_location=device,
         )
         print(f"Resuming from step {start_step}")
@@ -734,10 +849,14 @@ def train(args):
     os.makedirs(args.checkpoint_dir, exist_ok=True)
 
     # ---- wandb init ----
+    wandb_run_id = None
+    if args.resume and extra and isinstance(extra, dict):
+        wandb_run_id = extra.get("wandb_run_id", None)
     if use_wandb:
         wandb.init(
             project=args.wandb_project,
             name=args.wandb_name or f"cellflux-{args.model_channels}ch",
+            id=wandb_run_id,
             config=vars(args),
             resume="allow" if args.resume else None,
         )
@@ -840,27 +959,50 @@ def train(args):
             if ema is not None:
                 ema.restore()
 
-        # ---- FID (test split) ----
-        if args.fid_every > 0 and (step + 1) % args.fid_every == 0 and eval_dataset is not None:
+        # ---- Evaluation metrics (texture stats + FID) ----
+        if args.fid_every > 0 and (step + 1) % args.fid_every == 0:
+            eval_log = {}
             if ema is not None:
                 ema.apply_shadow()
 
-            fid_global, fid_per_cpd = compute_fid(
-                model, eval_dataset, device, args, id2cpd, fp_matrix,
-                ode_fn, time_grid, args.cfg_scale,
-            )
-            if fid_global is not None:
-                fid_log = {"fid/global": fid_global}
-                fid_vals = []
-                for cpd_name, fid_val in fid_per_cpd.items():
-                    fid_log[f"fid/cpd/{cpd_name}"] = fid_val
-                    fid_vals.append(fid_val)
-                if fid_vals:
-                    fid_log["fid/mean_per_cpd"] = np.mean(fid_vals)
-                print(f"[FID] global={fid_global:.2f}  mean_per_cpd={np.mean(fid_vals):.2f}")
-                if use_wandb:
-                    wandb.log(fid_log, step=step + 1)
-                logs["fid/global"].append(fid_global)
+            # --- Texture quality stats (ODE-solve on last training batch's ctrl) ---
+            model.eval()
+            try:
+                with torch.no_grad():
+                    cond_tex = fp_matrix[cpd_id].to(device)
+                    x_0_tex = img_ctrl + torch.randn_like(img_ctrl) * args.noise_level
+                    tex_fake = ode_fn(
+                        model, x_0_tex, time_grid.to(device),
+                        cond=cond_tex, cfg_scale=args.cfg_scale,
+                    )
+                    tex_fake_rgb = tex_fake[:, :3].contiguous()
+                tex_stats = compute_texture_stats(img_trt[:, :3], tex_fake_rgb)
+                eval_log.update(tex_stats)
+                for k, v in tex_stats.items():
+                    logs[k].append(v)
+            except Exception as e:
+                print(f"[warn] texture stats failed: {e}")
+            model.train()
+
+            # --- FID (test split) ---
+            if eval_dataset is not None:
+                fid_global, fid_per_cpd = compute_fid(
+                    model, eval_dataset, device, args, id2cpd, fp_matrix,
+                    ode_fn, time_grid, args.cfg_scale,
+                )
+                if fid_global is not None:
+                    eval_log["fid/global"] = fid_global
+                    fid_vals = []
+                    for cpd_name, fid_val in fid_per_cpd.items():
+                        eval_log[f"fid/cpd/{cpd_name}"] = fid_val
+                        fid_vals.append(fid_val)
+                    if fid_vals:
+                        eval_log["fid/mean_per_cpd"] = np.mean(fid_vals)
+                    print(f"[FID] global={fid_global:.2f}  mean_per_cpd={np.mean(fid_vals):.2f}")
+                    logs["fid/global"].append(fid_global)
+
+            if use_wandb and eval_log:
+                wandb.log(eval_log, step=step + 1)
 
             if ema is not None:
                 ema.restore()
@@ -875,10 +1017,14 @@ def train(args):
                 model, eval_dataset, device, args, fp_matrix, args.cfg_scale,
             )
             if fid_traj is not None:
+                # New format: compute_fid_trajectory returns {suffix_str: fid_val}.
+                # For noisy-only (backward compat) suffix is 't_0.167' etc. For
+                # clean or both, suffix is '{mode}_t_0.167'. Logging just prepends
+                # 'fid_traj/' — no float formatting needed.
                 traj_log = {}
-                for t_val, fid_val in sorted(fid_traj.items()):
-                    traj_log[f"fid_traj/t_{t_val:.3f}"] = fid_val
-                    print(f"  [FID traj] t={t_val:.3f} -> {fid_val:.2f}")
+                for suffix, fid_val in sorted(fid_traj.items()):
+                    traj_log[f"fid_traj/{suffix}"] = fid_val
+                    print(f"  [FID traj] {suffix} -> {fid_val:.2f}")
                 if use_wandb:
                     wandb.log(traj_log, step=step + 1)
 

@@ -740,13 +740,28 @@ def main():
         # force the model to use z. Brownian drift applied at eval time only.
 
         # ============ 5. Forward NCA with checkpoint sampling ============
+        # Single no-grad unroll: produces ckpt frames AND (if enabled) the
+        # intermediate snapshot from the SAME trajectory. Mirrors the pattern
+        # in train.py where forward_with_intermediate returns both endpoints.
+        if use_intermediate:
+            t_inter_d = torch.randint(0, max(1, T // 2), (1,)).item()
+            inter_step_d = t_inter_d + 1  # sample() saves frame at index t+1
+            output_steps_d = ckpt_set | {inter_step_d}
+        else:
+            output_steps_d = ckpt_set
+
         with torch.no_grad():
-            saved_ckpts = G.sample(
+            saved = G.sample(
                 pool_states, target_labels, n_steps=T,
-                output_steps=ckpt_set, z=pool_z, dose=target_doses,
+                output_steps=output_steps_d, z=pool_z, dose=target_doses,
             )
-            # saved_ckpts is a list of states at ckpt steps
-            all_ckpts = torch.stack(saved_ckpts)  # [num_ckpts, B, C, H, W]
+            sorted_d = sorted(output_steps_d)
+            if use_intermediate:
+                inter_full = saved[sorted_d.index(inter_step_d)]
+                ckpt_frames = [saved[i] for i, s in enumerate(sorted_d) if s in ckpt_set]
+            else:
+                ckpt_frames = saved
+            all_ckpts = torch.stack(ckpt_frames)  # [num_ckpts, B, C, H, W]
             final_state = all_ckpts[-1]  # last checkpoint = step T
 
             # Per-sample random checkpoint for D evaluation
@@ -759,6 +774,24 @@ def main():
         # ============ 6. Get real images for D ============
         real_img = image_bank.sample_batch(
             target_labels, target_doses, pool_plates).to(device)
+
+        # Real for null class ("any cell"): half DMSO + half random treated.
+        # Mirrors train.py:1134 (real_null = ctrl + trt). Reused by G phase below.
+        real_null = None
+        if use_intermediate:
+            half_b = args.batch_size // 2
+            null_dmso = image_bank.sample_batch(
+                torch.zeros(half_b, dtype=torch.long, device=device),
+                torch.zeros(half_b, device=device),
+            ).to(device)
+            trt_targets = image_bank.available_targets  # excludes DMSO
+            trt_idx = np.random.randint(len(trt_targets), size=args.batch_size - half_b)
+            null_trt_cpd = torch.tensor(
+                [trt_targets[i][0] for i in trt_idx], dtype=torch.long, device=device)
+            null_trt_dose = torch.tensor(
+                [trt_targets[i][1] for i in trt_idx], device=device)
+            null_trt = image_bank.sample_batch(null_trt_cpd, null_trt_dose).to(device)
+            real_null = torch.cat([null_dmso, null_trt], dim=0)
 
         # ============ 7. Discriminator step ============
         set_requires_grad(G, False)
@@ -777,23 +810,13 @@ def main():
         reg = 0.5 * args.gamma * (gp_real.mean() + gp_fake.mean())
         d_loss = adv_d + reg
 
-        # Intermediate regularization for D
+        # Intermediate regularization for D (uses inter_full from the single unroll above)
         d_inter_loss = torch.tensor(0.0, device=device)
         if use_intermediate:
-            with torch.no_grad():
-                t_inter = torch.randint(0, max(1, T // 2), (1,)).item()
-                _, inter_full = G.forward_with_intermediate(
-                    pool_states, target_labels, n_steps=T,
-                    t_intermediate=t_inter, z=pool_z, dose=target_doses,
-                )
-                inter_img = inter_full[:, :img_channels].contiguous()
+            inter_img = inter_full[:, :img_channels].contiguous()
 
-            # Real for null class: ctrl images (DMSO)
-            dmso_labels = torch.zeros(args.batch_size, dtype=torch.long, device=device)
-            dmso_doses = torch.zeros(args.batch_size, device=device)
-            real_null = image_bank.sample_batch(dmso_labels, dmso_doses).to(device)
-
-            null_ids = torch.full((args.batch_size,), null_class_id, dtype=torch.long, device=device)
+            null_ids = torch.full((args.batch_size,), null_class_id,
+                                  dtype=torch.long, device=device)
             real_null_req = real_null.requires_grad_(True)
             inter_req = inter_img.detach().requires_grad_(True)
 
@@ -817,11 +840,26 @@ def main():
         if S_opt is not None:
             S_opt.zero_grad(set_to_none=True)
 
-        # Re-run forward with gradients (fresh z for diversity signal)
+        # Pre-compute cond_z for style loss target. This recomputes the same
+        # value sample() uses internally; used only as a detached target.
+        cond_z_g = None
         if use_style:
-            fake_full_g, cond_z_g, z_g = G.forward_with_style(
-                pool_states, target_labels, n_steps=T, z=pool_z, dose=target_doses,
+            cond_z_g, _ = G._prepare_cond(target_labels, pool_z, target_doses)
+
+        # Single grad unroll: produces final state AND (if enabled) intermediate
+        # snapshot from one trajectory. Halves BPTT depth vs prior 2-unroll layout.
+        inter_full_g = None
+        if use_intermediate:
+            t_inter_g = torch.randint(0, max(1, T // 2), (1,)).item()
+            inter_step_g = t_inter_g + 1
+            output_steps_g = {T, inter_step_g}
+            sorted_g = sorted(output_steps_g)
+            samples_g = G.sample(
+                pool_states, target_labels, n_steps=T,
+                output_steps=output_steps_g, z=pool_z, dose=target_doses,
             )
+            fake_full_g = samples_g[sorted_g.index(T)]
+            inter_full_g = samples_g[sorted_g.index(inter_step_g)]
         else:
             fake_full_g = G(pool_states, target_labels, n_steps=T, z=pool_z, dose=target_doses)
 
@@ -836,16 +874,12 @@ def main():
             sum(F.softplus(-(d_fake_g[k] - d_real_g[k])).mean() for k in d_fake_g)
         total_g = g_loss
 
-        # Intermediate regularization for G
+        # Intermediate regularization for G (reuses inter_full_g and real_null from above)
         g_inter_loss = torch.tensor(0.0, device=device)
         if use_intermediate:
-            t_inter_g = torch.randint(0, max(1, T // 2), (1,)).item()
-            _, inter_full_g = G.forward_with_intermediate(
-                pool_states.detach(), target_labels, n_steps=T,
-                t_intermediate=t_inter_g, z=pool_z, dose=target_doses,
-            )
             inter_img_g = inter_full_g[:, :img_channels].contiguous()
-            null_ids_g = torch.full((args.batch_size,), null_class_id, dtype=torch.long, device=device)
+            null_ids_g = torch.full((args.batch_size,), null_class_id,
+                                    dtype=torch.long, device=device)
             d_inter_g = _to_float(D(inter_img_g, null_ids_g))
             d_real_null_g = _to_float(D(real_null.detach(), null_ids_g))
 

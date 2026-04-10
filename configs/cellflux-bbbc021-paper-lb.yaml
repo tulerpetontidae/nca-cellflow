@@ -43,5 +43,13 @@ save_every: 5000
 vis_every: 5000
 fid_every: 5000
 fid_trajectory_every: 5000
+# Trajectory FID reports clean (no-noise) init, NCA-aligned step selection so the
+# wandb keys collide 1:1 with NCA's 'fid_traj/step_N'. With 'naming: step' the
+# selection mirrors scripts/train.py:432-441 — for ode_steps=30 we get
+# step_1, step_6, step_12, step_18, step_24, step_30 (n_eval is ignored).
+# Endpoint FID (compute_fid) still uses noise — see line ~475.
+fid_trajectory_noise: clean
+fid_trajectory_naming: step
+fid_trajectory_ode_steps: 30
 checkpoint_dir: /oak/stanford/groups/ccurtis2/users/alomakin/projects/nca-cellflow/checkpoints/cellflux-bbbc021-paper-lb
 wandb_project: nca-cellflow

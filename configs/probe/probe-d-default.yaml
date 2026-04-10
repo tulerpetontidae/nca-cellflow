@@ -1,0 +1,34 @@
+# Probe: Discriminator baseline (matches old GAN default args)
+# base=32 blocks=2 stages=3 expansion=2 cardinality=4 kernel=3
+
+probe_type: discriminator
+
+# data
+metadata_csv: /oak/stanford/groups/ccurtis2/users/alomakin/projects/nca-cellflow/data/bbbc021_six/metadata/bbbc021_df_all.csv
+image_dir: /oak/stanford/groups/ccurtis2/users/alomakin/projects/nca-cellflow/data/bbbc021_six
+image_size: 48
+in_channels: 3
+
+# architecture
+d_stages: 3
+d_base_channels: 32
+d_blocks: 2
+d_cardinality: 4
+d_expansion: 2
+d_kernel_size: 3
+
+# training
+batch_size: 128
+iterations: 20000
+lr: 0.0003
+warmup_steps: 500
+grad_clip: 1.0
+num_workers: 8
+
+# eval
+eval_every: 1000
+eval_batch_size: 256
+log_every: 50
+
+# misc
+wandb_project: nca-cellflow-probe

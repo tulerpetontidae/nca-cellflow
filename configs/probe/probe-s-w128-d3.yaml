@@ -1,0 +1,24 @@
+# Probe: wider StyleEncoder — base=128, 3 downsamples, max=512
+probe_type: style_encoder
+
+metadata_csv: /oak/stanford/groups/ccurtis2/users/alomakin/projects/nca-cellflow/data/bbbc021_six/metadata/bbbc021_df_all.csv
+image_dir: /oak/stanford/groups/ccurtis2/users/alomakin/projects/nca-cellflow/data/bbbc021_six
+image_size: 48
+in_channels: 3
+
+s_base_channels: 128
+s_num_downsamples: 3
+s_max_channels: 512
+
+batch_size: 128
+iterations: 20000
+lr: 0.0003
+warmup_steps: 500
+grad_clip: 1.0
+num_workers: 8
+
+eval_every: 1000
+eval_batch_size: 256
+log_every: 50
+
+wandb_project: nca-cellflow-probe

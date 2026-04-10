@@ -1,0 +1,61 @@
+# LatentNCA, hidden12 + w128D (largest reasonable, no inter)
+# Pure D-scaling along the confirmed axis: bigD (364K) -> w96D (1.45M) -> w128D (~2.2M).
+# Drops s4 per probe finding (extra stage is dead weight at 48x48); keeps cardinality 4
+# for consistency with the w96D runs. This is a mild extrapolation from the probe sweep
+# (probe's d-w128-b4-s4 used stages=4, cardinality=8 and hit 0.823 acc).
+# Base: latent-hidden12-ema-steps30-v2-ss008-plate-fp-balanced-tanh-w96D-lb
+#
+# Stability note: this D is ~6x bigD. Watch logits/D_real_mean, logits/D_fake_mean,
+# and penalty/gp_* in first 10k steps. If they diverge, reduce lr_d or raise gamma.
+
+# data
+metadata_csv: /oak/stanford/groups/ccurtis2/users/alomakin/projects/nca-cellflow/data/bbbc021_six/metadata/bbbc021_df_all.csv
+image_dir: /oak/stanford/groups/ccurtis2/users/alomakin/projects/nca-cellflow/data/bbbc021_six
+image_size: 48
+plate_match: true
+balanced_cpd: true
+
+# model
+nca_type: latent
+z_dim: 16
+nca_hidden_dim: 128
+nca_cond_dim: 32
+cond_type: fingerprint
+fp_path: /oak/stanford/groups/ccurtis2/users/alomakin/projects/nca-cellflow/data/bbbc021_six/metadata/emb_morgan_fp.csv
+hidden_channels: 12
+fire_rate: 1.0
+nca_steps: 30
+step_size: 0.08
+use_tanh: true
+
+# discriminator (w128D: base 96 -> 128, blocks 3 -> 4, stages held at 3)
+d_stages: 3
+d_base_channels: 128
+d_blocks: 4
+d_cardinality: 4
+d_expansion: 2
+d_kernel_size: 3
+d_embed_dim: 32
+
+# training
+batch_size: 128
+iterations: 160000
+lr_g: 0.0002
+lr_d: 0.0002
+beta1: 0.0
+beta2: 0.99
+gamma: 1.0
+grad_clip: 1.0
+ema_decay: 0.999
+ema_warmup_steps: 1000
+
+# misc
+num_workers: 8
+save_every: 5000
+vis_every: 1000
+fid_every: 5000
+fid_trajectory_every: 5000
+val_fid: true
+grad_diag_every: 1000
+checkpoint_dir: /oak/stanford/groups/ccurtis2/users/alomakin/projects/nca-cellflow/checkpoints/latent-hidden12-ema-steps30-v2-ss008-plate-fp-balanced-tanh-w128D-lb
+wandb_project: nca-cellflow
