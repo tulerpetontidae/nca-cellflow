@@ -252,80 +252,78 @@ def plot_image_grid(images, suptitle, max_images=16):
 _fid_metric = None
 
 
-def _plate_from_key(key: str) -> str:
-    return key.split("_")[1]
-
-
 @torch.no_grad()
-def compute_fid_per_plate(G, metadata_csv, image_dir, device, args):
-    """Per-plate FID: NCA(test_ctrl, random_z) vs test_ctrl, stratified by plate.
+def compute_fid(G, metadata_csv, image_dir, device, args):
+    """FID: NCA(test_ctrl, random_z) vs matched-size sample of train ctrl.
 
-    Both the NCA input and the real comparison come from the same plate,
-    eliminating batch effects from the metric.  Reports mean across plates.
+    Real distribution: random sample of train ctrl images (same count as test).
+    Fake distribution: NCA applied to test ctrl images with random z.
     """
     global _fid_metric
     if not FID_AVAILABLE:
-        return None, None
+        print("[warn] torchmetrics not installed — skipping FID")
+        return None
     try:
         G.eval()
         if _fid_metric is None:
             _fid_metric = FrechetInceptionDistance(normalize=True).to(device)
+        _fid_metric.reset()
 
         df = pd.read_csv(metadata_csv, index_col=0)
-        df = df[(df["SPLIT"] == "test") & (df["STATE"] == 0)]
+        df_ctrl = df[df["STATE"] == 0]
+        test_keys = df_ctrl[df_ctrl["SPLIT"] == "test"]["SAMPLE_KEY"].values
+        train_keys = df_ctrl[df_ctrl["SPLIT"] == "train"]["SAMPLE_KEY"].values
 
-        plate_groups: dict[str, list[str]] = {}
-        for key in df["SAMPLE_KEY"].values:
-            plate_groups.setdefault(_plate_from_key(key), []).append(key)
+        # Sample train ctrl to match test count
+        n = len(test_keys)
+        rng = np.random.RandomState(0)
+        real_keys = rng.choice(train_keys, size=min(n, len(train_keys)), replace=False)
 
-        dummy_cond = torch.zeros(args.batch_size, dtype=torch.long, device=device)
         image_path = Path(image_dir)
-        fid_per_plate = {}
+        dummy_cond = torch.zeros(args.batch_size, dtype=torch.long, device=device)
 
-        for plate, keys in plate_groups.items():
-            if len(keys) < 50:
-                continue
-            _fid_metric.reset()
+        # Real: train ctrl sample
+        for i in range(0, len(real_keys), args.batch_size):
+            batch_keys = real_keys[i:i + args.batch_size]
+            imgs = torch.stack([
+                _load_image(image_path, k, args.image_size, augment=False)
+                for k in batch_keys
+            ]).to(device)
+            real_01 = torch.floor(((imgs.clamp(-1, 1) + 1) / 2) * 255).float() / 255.0
+            _fid_metric.update(real_01, real=True)
 
-            for i in range(0, len(keys), args.batch_size):
-                batch_keys = keys[i:i + args.batch_size]
-                B = len(batch_keys)
-                imgs = torch.stack([
-                    _load_image(image_path, k, args.image_size, augment=False)
-                    for k in batch_keys
-                ]).to(device)
+        # Fake: NCA(test ctrl, random z)
+        for i in range(0, len(test_keys), args.batch_size):
+            batch_keys = test_keys[i:i + args.batch_size]
+            B = len(batch_keys)
+            imgs = torch.stack([
+                _load_image(image_path, k, args.image_size, augment=False)
+                for k in batch_keys
+            ]).to(device)
 
-                z = torch.randn(B, args.z_dim, device=device)
-                if args.hidden_channels > 0:
-                    pad = torch.zeros(B, args.hidden_channels,
-                                      args.image_size, args.image_size, device=device)
-                    nca_in = torch.cat([imgs, pad], dim=1)
-                else:
-                    nca_in = imgs
-                fake = G(nca_in, dummy_cond[:B], n_steps=args.nca_steps, z=z)
-                fake_rgb = fake[:, :3].clamp(-1, 1)
+            z = torch.randn(B, args.z_dim, device=device)
+            if args.hidden_channels > 0:
+                pad = torch.zeros(B, args.hidden_channels,
+                                  args.image_size, args.image_size, device=device)
+                nca_in = torch.cat([imgs, pad], dim=1)
+            else:
+                nca_in = imgs
+            fake = G(nca_in, dummy_cond[:B], n_steps=args.nca_steps, z=z)
+            fake_rgb = fake[:, :3].clamp(-1, 1)
+            fake_01 = torch.floor(((fake_rgb + 1) / 2) * 255).float() / 255.0
+            _fid_metric.update(fake_01, real=False)
 
-                real_01 = torch.floor(((imgs.clamp(-1, 1) + 1) / 2) * 255).float() / 255.0
-                fake_01 = torch.floor(((fake_rgb + 1) / 2) * 255).float() / 255.0
-                _fid_metric.update(real_01, real=True)
-                _fid_metric.update(fake_01, real=False)
-
-            try:
-                fid_per_plate[plate] = _fid_metric.compute().item()
-            except Exception:
-                continue
-
+        fid = _fid_metric.compute().item()
         G.train()
-        if not fid_per_plate:
-            return None, None
-        mean_fid = sum(fid_per_plate.values()) / len(fid_per_plate)
-        return mean_fid, fid_per_plate
+        return fid
 
     except Exception as e:
         print(f"[warn] FID failed: {e}")
+        import traceback
+        traceback.print_exc()
         G.train()
         torch.cuda.empty_cache()
-        return None, None
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -842,19 +840,15 @@ def train(args):
             else:
                 plt.show()
 
-        # ================ FID (per-plate, test ctrl) ================
+        # ================ FID ================
         if args.fid_every > 0 and (step + 1) % args.fid_every == 0:
             eval_G = G_ema.module if use_ema else G
-            mean_fid, fid_plates = compute_fid_per_plate(
-                eval_G, args.metadata_csv, args.image_dir, device, args)
-            if mean_fid is not None:
-                logs["fid/mean_per_plate"].append(mean_fid)
-                print(f"[FID] step {step+1}: mean_per_plate={mean_fid:.2f}")
-                fid_log = {"fid/mean_per_plate": mean_fid}
-                for plate, val in fid_plates.items():
-                    fid_log[f"fid/plate/{plate}"] = val
+            fid = compute_fid(eval_G, args.metadata_csv, args.image_dir, device, args)
+            if fid is not None:
+                logs["fid/global"].append(fid)
+                print(f"[FID] step {step+1}: {fid:.2f}")
                 if use_wandb:
-                    wandb.log(fid_log, step=step + 1)
+                    wandb.log({"fid/global": fid}, step=step + 1)
 
         # ================ Checkpointing ================
         is_save = (step + 1) % args.save_every == 0
