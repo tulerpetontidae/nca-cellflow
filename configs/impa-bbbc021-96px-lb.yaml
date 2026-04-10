@@ -1,0 +1,40 @@
+# IMPA baseline (StarGAN-v2 style) — 96px full resolution
+# 96x96 version of impa-bbbc021-lb, paper hyperparameters.
+
+# data
+metadata_csv: data/bbbc021_six/metadata/bbbc021_df_all.csv
+image_dir: data/bbbc021_six
+image_size: 96
+plate_match: true
+fp_path: data/bbbc021_six/metadata/emb_morgan_fp.csv
+
+# model (IMPA paper: bbbc021_six config)
+style_dim: 64
+z_dimension: 16
+dim_in: 64
+max_conv_dim: 512
+num_layers_mapping_net: 1
+
+# losses (all 1.0, matching paper)
+lambda_reg: 1.0
+lambda_cyc: 1.0
+lambda_sty: 1.0
+lambda_ds: 1.0
+ds_iter: 100000
+
+# training (IMPA paper defaults)
+batch_size: 128
+iterations: 80000
+lr: 0.0001
+f_lr: 0.0001
+beta1: 0.0
+beta2: 0.99
+weight_decay: 0.0001
+
+# misc
+num_workers: 8
+save_every: 5000
+vis_every: 5000
+fid_every: 5000
+fid_trajectory_every: 5000
+wandb_project: nca-cellflow-comp

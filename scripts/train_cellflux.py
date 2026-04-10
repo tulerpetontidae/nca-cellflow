@@ -187,10 +187,9 @@ def plot_flow_trajectories(model, dataset, device, args, id2cpd, fp_matrix,
         [0] + [int(round(i * n_vis_steps / (n_cols - 1))) for i in range(n_cols)]
     ))
 
-    # Load ctrl image and fix noise so every compound starts from the same x_0
+    # Load ctrl image — clean init for visualization (no noise)
     img_ctrl = dataset._load(dataset.ctrl_keys[0]).unsqueeze(0).to(device)
-    noise = torch.randn_like(img_ctrl) * args.noise_level
-    x_0_shared = img_ctrl + noise  # same init for all compounds
+    x_0_shared = img_ctrl  # same init for all compounds
 
     num_compounds = len(id2cpd)
     fig, axes = plt.subplots(num_compounds, len(step_indices),
@@ -945,7 +944,7 @@ def train(args):
             # Generate a batch for visualization using full ODE solver
             with torch.no_grad():
                 vis_cond = fp_matrix[cpd_id]
-                x_0_vis = img_ctrl + torch.randn_like(img_ctrl) * args.noise_level
+                x_0_vis = img_ctrl  # clean init for visualization (no noise)
                 fake = ode_fn(model, x_0_vis, time_grid, cond=vis_cond, cfg_scale=args.cfg_scale)
                 fake_rgb = fake[:, :3]
 
