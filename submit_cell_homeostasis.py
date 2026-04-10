@@ -32,29 +32,30 @@ _cfg_prefix = "configs/style-hidden12-ema-steps30-ss008-tanh-bigD"
 _ckpt_prefix = f"{_project_dir}/checkpoints/style-hidden12-ema-steps30-ss008-tanh-bigD"
 
 configs = [
-    # 1. Base — style recon only
+    # --- Anti-steganography sweep (all pooled, z_dim=128) ---
+    # 1. Noise before E
     {
-        "wandb_name": "style-base",
-        "config": f"{_cfg_prefix}-base-lb.yaml",
-        "checkpoint_dir": f"{_ckpt_prefix}-base-lb",
+        "wandb_name": "style-enoise-z128-pool",
+        "config": f"{_cfg_prefix}-enoise-z128-pool-lb.yaml",
+        "checkpoint_dir": f"{_ckpt_prefix}-enoise-z128-pool-lb",
     },
-    # 2. + intermediate D
+    # 2. Blur + noise before E
     {
-        "wandb_name": "style-inter",
-        "config": f"{_cfg_prefix}-inter-lb.yaml",
-        "checkpoint_dir": f"{_ckpt_prefix}-inter-lb",
+        "wandb_name": "style-eblur-z128-pool",
+        "config": f"{_cfg_prefix}-eblur-z128-pool-lb.yaml",
+        "checkpoint_dir": f"{_ckpt_prefix}-eblur-z128-pool-lb",
     },
-    # 3. + pool (homeostasis)
+    # 3. Downsample before E (48->12)
     {
-        "wandb_name": "style-pool",
-        "config": f"{_cfg_prefix}-pool-lb.yaml",
-        "checkpoint_dir": f"{_ckpt_prefix}-pool-lb",
+        "wandb_name": "style-edown-z128-pool",
+        "config": f"{_cfg_prefix}-edown-z128-pool-lb.yaml",
+        "checkpoint_dir": f"{_ckpt_prefix}-edown-z128-pool-lb",
     },
-    # 4. + pool + intermediate
+    # 4. Blur + noise, z_dim=32 (control: is large z needed?)
     {
-        "wandb_name": "style-pool-inter",
-        "config": f"{_cfg_prefix}-pool-inter-lb.yaml",
-        "checkpoint_dir": f"{_ckpt_prefix}-pool-inter-lb",
+        "wandb_name": "style-eblur-z32-pool",
+        "config": f"{_cfg_prefix}-eblur-z32-pool-lb.yaml",
+        "checkpoint_dir": f"{_ckpt_prefix}-eblur-z32-pool-lb",
     },
 ]
 

@@ -89,6 +89,33 @@ def to_rgb_numpy(img):
 
 
 # ---------------------------------------------------------------------------
+# Anti-steganography: augment image before style encoder
+# ---------------------------------------------------------------------------
+
+def _gaussian_blur(x, kernel_size=5, sigma=1.0):
+    k = kernel_size
+    coords = torch.arange(k, dtype=torch.float32, device=x.device) - k // 2
+    g = torch.exp(-coords.pow(2) / (2 * sigma ** 2))
+    g = g / g.sum()
+    kernel = (g[:, None] * g[None, :]).view(1, 1, k, k).repeat(x.shape[1], 1, 1, 1)
+    return F.conv2d(x, kernel, padding=k // 2, groups=x.shape[1])
+
+
+def augment_for_encoder(x, noise_sigma=0.0, blur_sigma=0.0, downsample=0):
+    """Augment generated image before style encoder to prevent steganography.
+
+    Applied in order: blur -> downsample -> noise.  Each is optional (0 = off).
+    """
+    if blur_sigma > 0:
+        x = _gaussian_blur(x, kernel_size=5, sigma=blur_sigma)
+    if downsample > 0:
+        x = F.avg_pool2d(x, downsample)
+    if noise_sigma > 0:
+        x = x + noise_sigma * torch.randn_like(x)
+    return x
+
+
+# ---------------------------------------------------------------------------
 # Checkpointing
 # ---------------------------------------------------------------------------
 
@@ -397,6 +424,14 @@ def make_parser():
     # style reconstruction
     p.add_argument("--style_weight", type=float, default=1.0)
 
+    # anti-steganography (augment before style encoder)
+    p.add_argument("--encoder_noise", type=float, default=0.0,
+                   help="Gaussian noise sigma added before E (0 = off)")
+    p.add_argument("--encoder_blur_sigma", type=float, default=0.0,
+                   help="Gaussian blur sigma before E (0 = off)")
+    p.add_argument("--encoder_downsample", type=int, default=0,
+                   help="Avg-pool factor before E, e.g. 4 means 48->12 (0 = off)")
+
     # regularisation
     p.add_argument("--intermediate_weight", type=float, default=0.0,
                    help="Intermediate NCA step D loss (manifold regularisation)")
@@ -467,7 +502,9 @@ def load_config_into_args(args):
 def train(args):
     args = load_config_into_args(args)
     print(f"[config] z_dim={args.z_dim}, style_weight={args.style_weight}, "
-          f"intermediate_weight={args.intermediate_weight}, use_pool={args.use_pool}")
+          f"intermediate_weight={args.intermediate_weight}, use_pool={args.use_pool}, "
+          f"enc_noise={args.encoder_noise}, enc_blur={args.encoder_blur_sigma}, "
+          f"enc_down={args.encoder_downsample}")
 
     use_wandb = args.wandb and WANDB_AVAILABLE
     if args.wandb and not WANDB_AVAILABLE:
@@ -517,10 +554,18 @@ def train(args):
     ).to(device)
 
     # --- Style Encoder (Q-network: image -> z_hat) ---
+    # Auto-reduce downsamples when E sees downsampled input
+    s_num_ds = args.s_num_downsamples
+    if args.encoder_downsample > 0:
+        eff_size = args.image_size // args.encoder_downsample
+        max_ds = max(1, int(np.log2(eff_size)) - 1)
+        s_num_ds = min(s_num_ds, max_ds)
+        print(f"[E] input downsampled {args.image_size}->{eff_size}, "
+              f"using {s_num_ds} downsamples (was {args.s_num_downsamples})")
     E = ResBlkStyleEncoder(
         in_channels=img_channels,
         base_channels=args.s_base_channels,
-        num_downsamples=args.s_num_downsamples,
+        num_downsamples=s_num_ds,
         max_channels=args.s_max_channels,
         z_dim=args.z_dim,
     ).to(device)
@@ -587,7 +632,6 @@ def train(args):
             z_dim=args.z_dim,
             device=device,
         )
-        populate_pool(pool, dataset, device, img_channels)
         print(f"Pool: {args.pool_size} slots, {args.nca_steps} steps/cycle, "
               f"recycle after {args.pool_recycle_threshold} cycles "
               f"({args.pool_recycle_threshold * args.nca_steps} total steps)")
@@ -601,7 +645,13 @@ def train(args):
             args.resume, G, D, E, G_opt, D_opt, G_ema=G_ema, map_location=device)
         if use_pool and extra and "pool_state" in extra:
             pool.load_state_dict(extra["pool_state"], device=device)
+            print(f"[pool] restored {args.pool_size} slots from checkpoint")
         print(f"Resuming from step {start_step}")
+
+    # Populate pool from scratch if not resumed
+    if use_pool and (not args.resume or not extra or "pool_state" not in extra):
+        populate_pool(pool, dataset, device, img_channels)
+        print(f"[pool] populated {args.pool_size} slots with fresh ctrl images")
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
 
@@ -760,11 +810,15 @@ def train(args):
             total_loss = total_loss + args.intermediate_weight * g_inter_adv
             accum_g_inter = g_inter_adv.item()
 
-        # Style reconstruction: E(fake) should recover the random z
+        # Style reconstruction: E(augmented fake) should recover the random z
         accum_style = 0.0
         if args.style_weight > 0:
+            aug_fake = augment_for_encoder(
+                fake_img_g, noise_sigma=args.encoder_noise,
+                blur_sigma=args.encoder_blur_sigma,
+                downsample=args.encoder_downsample)
             with autocast():
-                z_hat = E(fake_img_g)
+                z_hat = E(aug_fake)
             sty_loss = F.l1_loss(z_hat, z_g.detach())
             total_loss = total_loss + args.style_weight * sty_loss
             accum_style = sty_loss.item()
@@ -868,6 +922,9 @@ def train(args):
                 "s_num_downsamples": args.s_num_downsamples,
                 "s_max_channels": args.s_max_channels,
                 "style_weight": args.style_weight,
+                "encoder_noise": args.encoder_noise,
+                "encoder_blur_sigma": args.encoder_blur_sigma,
+                "encoder_downsample": args.encoder_downsample,
                 "intermediate_weight": args.intermediate_weight,
                 "use_pool": args.use_pool,
                 "ema_decay": args.ema_decay,
