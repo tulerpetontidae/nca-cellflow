@@ -339,8 +339,8 @@ class CtrlPairDataset(Dataset):
     """Ctrl-only dataset returning pairs of ctrl images for self-supervised NCA.
 
     Returns (img_input, img_ref) where both are ctrl (DMSO) images.
-    img_input serves as NCA input, img_ref as style reference for encoding z.
-    Also usable for FID evaluation with augment=False and deterministic_ref=True.
+    img_input serves as NCA input, img_ref as D real sample.
+    All images are preloaded into RAM as uint8 arrays and augmented on the fly.
 
     Args:
         metadata_csv: Path to bbbc021_df_all.csv.
@@ -363,18 +363,67 @@ class CtrlPairDataset(Dataset):
         self.augment = augment
         self.deterministic_ref = deterministic_ref
 
+        # Preload all ctrl images into RAM (uint8 to save memory)
+        self._cache = {}
+        pkl_path = self.image_dir / "images.pkl"
+        if pkl_path.exists():
+            import pickle
+            print(f"[CtrlPairDataset] Loading from {pkl_path}...")
+            with open(pkl_path, "rb") as f:
+                all_images = pickle.load(f)
+            for key in self.ctrl_keys:
+                img = all_images[key]
+                if image_size != img.shape[0]:
+                    t = torch.from_numpy(img.astype(np.float32)).permute(2, 0, 1)
+                    t = F.interpolate(t.unsqueeze(0), size=image_size,
+                                      mode="bilinear", antialias=True).squeeze(0)
+                    self._cache[key] = t
+                else:
+                    self._cache[key] = img
+            del all_images
+        else:
+            print(f"[CtrlPairDataset] Preloading {len(self.ctrl_keys)} images from disk...")
+            for key in self.ctrl_keys:
+                parts = key.split("_")
+                path = self.image_dir / parts[0] / parts[1] / ("_".join(parts[2:]) + ".npy")
+                img = np.load(path)
+                if image_size != img.shape[0]:
+                    t = torch.from_numpy(img.astype(np.float32)).permute(2, 0, 1)
+                    t = F.interpolate(t.unsqueeze(0), size=image_size,
+                                      mode="bilinear", antialias=True).squeeze(0)
+                    self._cache[key] = t
+                else:
+                    self._cache[key] = img
+        print(f"[CtrlPairDataset] {len(self._cache)} images cached ({split})")
+
     def __len__(self):
         return len(self.ctrl_keys)
 
+    def _load_cached(self, key: str) -> torch.Tensor:
+        raw = self._cache[key]
+        if isinstance(raw, np.ndarray):
+            img = torch.from_numpy(raw.astype(np.float32)).permute(2, 0, 1)
+        else:
+            img = raw.clone()
+        if self.augment:
+            img = (img + torch.rand_like(img)) / 255.0
+        else:
+            img = (img + 0.5) / 255.0
+        img = img * 2.0 - 1.0
+        if self.augment:
+            if torch.rand(1).item() < 0.5:
+                img = img.flip(-1)
+            if torch.rand(1).item() < 0.5:
+                img = img.flip(-2)
+        return img
+
     def __getitem__(self, idx):
-        img_input = _load_image(self.image_dir, self.ctrl_keys[idx],
-                                self.image_size, augment=self.augment)
+        img_input = self._load_cached(self.ctrl_keys[idx])
         if self.deterministic_ref:
             ref_idx = (idx + len(self.ctrl_keys) // 2) % len(self.ctrl_keys)
         else:
             ref_idx = np.random.randint(len(self.ctrl_keys))
-        img_ref = _load_image(self.image_dir, self.ctrl_keys[ref_idx],
-                              self.image_size, augment=self.augment)
+        img_ref = self._load_cached(self.ctrl_keys[ref_idx])
         return img_input, img_ref
 
 
