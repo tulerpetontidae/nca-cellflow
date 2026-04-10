@@ -440,6 +440,10 @@ def make_parser():
     # regularisation
     p.add_argument("--intermediate_weight", type=float, default=0.0,
                    help="Intermediate NCA step D loss (manifold regularisation)")
+    p.add_argument("--diversity_weight", type=float, default=0.0,
+                   help="Diversity loss: different z -> different downsampled output (0 = off)")
+    p.add_argument("--diversity_decay_steps", type=int, default=50000,
+                   help="Linearly decay diversity_weight to 0 over this many steps")
 
     # pool
     p.add_argument("--use_pool", action="store_true",
@@ -840,6 +844,26 @@ def train(args):
             total_loss = total_loss + args.style_weight * sty_loss
             accum_style = sty_loss.item()
 
+        # Diversity loss: different z -> different output (measured on downsampled images)
+        accum_div = 0.0
+        if args.diversity_weight > 0:
+            decay = max(0.0, 1.0 - step / args.diversity_decay_steps)
+            div_w = args.diversity_weight * decay
+            if div_w > 1e-6:
+                z2 = torch.randn(B, args.z_dim, device=device)
+                with torch.no_grad():
+                    if use_pool:
+                        fake2 = G(p_states.detach(), cond, n_steps=args.nca_steps, z=z2)
+                    else:
+                        fake2 = G(nca_input, cond, n_steps=args.nca_steps, z=z2)
+                    fake2_rgb = fake2[:, :img_channels].contiguous()
+                # Downsample to 12x12 to measure structural diversity, not pixel noise
+                fake1_down = F.avg_pool2d(fake_img_g, 4)
+                fake2_down = F.avg_pool2d(fake2_rgb, 4)
+                div_loss = -(fake1_down - fake2_down.detach()).abs().mean()
+                total_loss = total_loss + div_w * div_loss
+                accum_div = div_loss.item()
+
         total_loss.backward()
         nn_utils.clip_grad_norm_(g_params, max_norm=args.grad_clip)
         G_opt.step()
@@ -876,6 +900,9 @@ def train(args):
         if use_intermediate:
             log_dict["loss/D_inter"] = accum_d_inter
             log_dict["loss/G_inter"] = accum_g_inter
+        if args.diversity_weight > 0:
+            log_dict["loss/diversity"] = accum_div
+            log_dict["diversity_weight_eff"] = args.diversity_weight * max(0.0, 1.0 - step / args.diversity_decay_steps)
 
         for k, v in log_dict.items():
             logs[k].append(v)
@@ -943,6 +970,8 @@ def train(args):
                 "encoder_blur_sigma": args.encoder_blur_sigma,
                 "encoder_downsample": args.encoder_downsample,
                 "intermediate_weight": args.intermediate_weight,
+                "diversity_weight": args.diversity_weight,
+                "diversity_decay_steps": args.diversity_decay_steps,
                 "use_pool": args.use_pool,
                 "ema_decay": args.ema_decay,
                 "wandb_run_id": wandb.run.id if use_wandb else None,

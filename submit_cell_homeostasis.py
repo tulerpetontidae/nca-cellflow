@@ -32,30 +32,44 @@ _cfg_prefix = "configs/style-hidden12-ema-steps30-ss008-tanh-bigD"
 _ckpt_prefix = f"{_project_dir}/checkpoints/style-hidden12-ema-steps30-ss008-tanh-bigD"
 
 configs = [
-    # --- Anti-steganography sweep (all pooled, fresh random z each cycle) ---
-    # 1. Noise before E
+    # # --- Previous: encoder augmentation (bootstrap failure, parked) ---
+    # # 1. Noise before E
+    # {
+    #     "wandb_name": "style-enoise-z128-randz-pool",
+    #     "config": f"{_cfg_prefix}-enoise-z128-randz-pool-lb.yaml",
+    #     "checkpoint_dir": f"{_ckpt_prefix}-enoise-z128-randz-pool-lb",
+    # },
+    # # 2. Blur + noise before E
+    # {
+    #     "wandb_name": "style-eblur-z128-randz-pool",
+    #     "config": f"{_cfg_prefix}-eblur-z128-randz-pool-lb.yaml",
+    #     "checkpoint_dir": f"{_ckpt_prefix}-eblur-z128-randz-pool-lb",
+    # },
+    # # 3. Downsample before E (48->12)
+    # {
+    #     "wandb_name": "style-edown-z128-randz-pool",
+    #     "config": f"{_cfg_prefix}-edown-z128-randz-pool-lb.yaml",
+    #     "checkpoint_dir": f"{_ckpt_prefix}-edown-z128-randz-pool-lb",
+    # },
+    # # 4. Blur + noise, z_dim=32
+    # {
+    #     "wandb_name": "style-eblur-z32-randz-pool",
+    #     "config": f"{_cfg_prefix}-eblur-z32-randz-pool-lb.yaml",
+    #     "checkpoint_dir": f"{_ckpt_prefix}-eblur-z32-randz-pool-lb",
+    # },
+
+    # --- Round 2: diversity loss to bootstrap visible changes ---
+    # 5. Diversity (decaying) — no encoder augmentation
     {
-        "wandb_name": "style-enoise-z128-randz-pool",
-        "config": f"{_cfg_prefix}-enoise-z128-randz-pool-lb.yaml",
-        "checkpoint_dir": f"{_ckpt_prefix}-enoise-z128-randz-pool-lb",
+        "wandb_name": "style-div-z128-randz-pool",
+        "config": f"{_cfg_prefix}-div-z128-randz-pool-lb.yaml",
+        "checkpoint_dir": f"{_ckpt_prefix}-div-z128-randz-pool-lb",
     },
-    # 2. Blur + noise before E
+    # 6. Diversity (decaying) + noise before E
     {
-        "wandb_name": "style-eblur-z128-randz-pool",
-        "config": f"{_cfg_prefix}-eblur-z128-randz-pool-lb.yaml",
-        "checkpoint_dir": f"{_ckpt_prefix}-eblur-z128-randz-pool-lb",
-    },
-    # 3. Downsample before E (48->12)
-    {
-        "wandb_name": "style-edown-z128-randz-pool",
-        "config": f"{_cfg_prefix}-edown-z128-randz-pool-lb.yaml",
-        "checkpoint_dir": f"{_ckpt_prefix}-edown-z128-randz-pool-lb",
-    },
-    # 4. Blur + noise, z_dim=32 (control: is large z needed?)
-    {
-        "wandb_name": "style-eblur-z32-randz-pool",
-        "config": f"{_cfg_prefix}-eblur-z32-randz-pool-lb.yaml",
-        "checkpoint_dir": f"{_ckpt_prefix}-eblur-z32-randz-pool-lb",
+        "wandb_name": "style-div-enoise-z128-randz-pool",
+        "config": f"{_cfg_prefix}-div-enoise-z128-randz-pool-lb.yaml",
+        "checkpoint_dir": f"{_ckpt_prefix}-div-enoise-z128-randz-pool-lb",
     },
 ]
 
