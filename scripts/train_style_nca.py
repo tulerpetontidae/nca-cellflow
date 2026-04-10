@@ -714,19 +714,20 @@ def train(args):
         set_requires_grad(D, True)
         D_opt.zero_grad(set_to_none=True)
 
+        # z is always fresh random — never stored in pool
+        z = torch.randn(B, args.z_dim, device=device)
+
         with torch.no_grad():
             if use_pool:
-                p_idx, p_states, _, _, _, p_z = pool.get_batch(B)
+                p_idx, p_states, _, _, _, _ = pool.get_batch(B)
                 if use_intermediate:
                     t_inter_d = torch.randint(0, args.nca_steps - 1, (1,)).item()
                     fake_full, inter_full = G.forward_with_intermediate(
                         p_states, cond, n_steps=args.nca_steps,
-                        t_intermediate=t_inter_d, z=p_z)
+                        t_intermediate=t_inter_d, z=z)
                 else:
-                    fake_full = G(p_states, cond, n_steps=args.nca_steps, z=p_z)
+                    fake_full = G(p_states, cond, n_steps=args.nca_steps, z=z)
             else:
-                # z is RANDOM, not from encoder
-                z = torch.randn(B, args.z_dim, device=device)
                 if args.hidden_channels > 0:
                     pad = torch.zeros(B, args.hidden_channels,
                                       img_input.shape[2], img_input.shape[3], device=device)
@@ -779,8 +780,8 @@ def train(args):
         set_requires_grad(D, False)
         G_opt.zero_grad(set_to_none=True)
 
+        z_g = z  # same random z as D step
         if use_pool:
-            z_g = p_z  # stored random z
             with autocast():
                 if use_intermediate:
                     t_inter_g = torch.randint(0, args.nca_steps - 1, (1,)).item()
@@ -791,8 +792,6 @@ def train(args):
                     fake_full_g = G(p_states.detach(), cond,
                                     n_steps=args.nca_steps, z=z_g)
         else:
-            # Same random z as D step (same batch, deterministic within step)
-            z_g = z  # from D step above
             if args.hidden_channels > 0:
                 pad = torch.zeros(B, args.hidden_channels,
                                   img_input.shape[2], img_input.shape[3], device=device)
@@ -853,7 +852,7 @@ def train(args):
             pool.update(p_idx, fake_full_g.detach(),
                         pool.labels[p_idx], pool.doses[p_idx],
                         [pool.plates[i.item()] for i in p_idx],
-                        p_z.detach())
+                        pool.z[p_idx])  # z not used, just pass existing
             if (step + 1) % args.pool_recycle_every == 0:
                 n_recycled = recycle_pool_slots(
                     pool, args.pool_recycle_threshold,
