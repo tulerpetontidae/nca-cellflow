@@ -544,10 +544,10 @@ def train(args):
             _all_imgs.append(torch.from_numpy(raw.astype(np.float32)).permute(2, 0, 1))
         else:
             _all_imgs.append(raw)
-    ctrl_bank = torch.stack(_all_imgs)  # [N, 3, H, W] uint8-scale floats
+    ctrl_bank = torch.stack(_all_imgs).to(device)  # [N, 3, H, W] on GPU
     del _all_imgs, dataset._cache
     N_ctrl = ctrl_bank.shape[0]
-    print(f"Ctrl bank: {N_ctrl} images, {ctrl_bank.shape}, "
+    print(f"Ctrl bank: {N_ctrl} images on {device}, "
           f"{ctrl_bank.element_size() * ctrl_bank.nelement() / 1e6:.0f} MB")
 
     # Channels
@@ -682,9 +682,9 @@ def train(args):
     dummy_cond = torch.zeros(args.batch_size, dtype=torch.long, device=device)
 
     def sample_ctrl_batch(B):
-        """Sample B random ctrl images from the preloaded bank, augment, move to GPU."""
-        idx = torch.randint(N_ctrl, (B,))
-        imgs = ctrl_bank[idx].clone()  # [B, 3, H, W] uint8-scale
+        """Sample B random ctrl images from the GPU-resident bank, augment in-place."""
+        idx = torch.randint(N_ctrl, (B,), device=device)
+        imgs = ctrl_bank[idx].clone()  # [B, 3, H, W] already on GPU
         # Dither + normalize to [-1, 1]
         imgs = (imgs + torch.rand_like(imgs)) / 255.0
         imgs = imgs * 2.0 - 1.0
@@ -693,7 +693,7 @@ def train(args):
             imgs = imgs.flip(-1)
         if torch.rand(1).item() < 0.5:
             imgs = imgs.flip(-2)
-        return imgs.to(device)
+        return imgs
 
     # --- Training loop ---
     pbar = tqdm(range(start_step, args.iterations), desc="Training",
