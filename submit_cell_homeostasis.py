@@ -36,26 +36,26 @@ configs = [
     # 1. Noise before E
     {
         "wandb_name": "style-enoise-z128-randz-pool",
-        "config": f"{_cfg_prefix}-enoise-z128-pool-lb.yaml",
-        "checkpoint_dir": f"{_ckpt_prefix}-enoise-z128-pool-lb",
+        "config": f"{_cfg_prefix}-enoise-z128-randz-pool-lb.yaml",
+        "checkpoint_dir": f"{_ckpt_prefix}-enoise-z128-randz-pool-lb",
     },
     # 2. Blur + noise before E
     {
         "wandb_name": "style-eblur-z128-randz-pool",
-        "config": f"{_cfg_prefix}-eblur-z128-pool-lb.yaml",
-        "checkpoint_dir": f"{_ckpt_prefix}-eblur-z128-pool-lb",
+        "config": f"{_cfg_prefix}-eblur-z128-randz-pool-lb.yaml",
+        "checkpoint_dir": f"{_ckpt_prefix}-eblur-z128-randz-pool-lb",
     },
     # 3. Downsample before E (48->12)
     {
         "wandb_name": "style-edown-z128-randz-pool",
-        "config": f"{_cfg_prefix}-edown-z128-pool-lb.yaml",
-        "checkpoint_dir": f"{_ckpt_prefix}-edown-z128-pool-lb",
+        "config": f"{_cfg_prefix}-edown-z128-randz-pool-lb.yaml",
+        "checkpoint_dir": f"{_ckpt_prefix}-edown-z128-randz-pool-lb",
     },
     # 4. Blur + noise, z_dim=32 (control: is large z needed?)
     {
         "wandb_name": "style-eblur-z32-randz-pool",
-        "config": f"{_cfg_prefix}-eblur-z32-pool-lb.yaml",
-        "checkpoint_dir": f"{_ckpt_prefix}-eblur-z32-pool-lb",
+        "config": f"{_cfg_prefix}-eblur-z32-randz-pool-lb.yaml",
+        "checkpoint_dir": f"{_ckpt_prefix}-eblur-z32-randz-pool-lb",
     },
 ]
 
