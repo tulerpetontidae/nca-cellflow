@@ -159,7 +159,7 @@ def load_checkpoint(path, G, D, E, G_opt=None, D_opt=None, G_ema=None, map_locat
 # Visualization
 # ---------------------------------------------------------------------------
 
-def plot_random_z_trajectories(G, dataset, device, args, step):
+def plot_random_z_trajectories(G, ctrl_bank, device, args, step):
     """Fixed input, different random z -> trajectory grid."""
     G.eval()
     n_rows = 6
@@ -168,8 +168,8 @@ def plot_random_z_trajectories(G, dataset, device, args, step):
     n_cols = 1 + n_traj
     output_steps = sorted(set(int(round((i + 1) * T / n_traj)) for i in range(n_traj)))
 
-    img_input, _ = dataset[0]
-    img_input = img_input.unsqueeze(0).to(device)
+    raw = ctrl_bank[0].float()
+    img_input = ((raw + 0.5) / 255.0 * 2.0 - 1.0).unsqueeze(0).to(device)
     if args.hidden_channels > 0:
         pad = torch.zeros(1, args.hidden_channels, img_input.shape[2], img_input.shape[3], device=device)
         nca_input = torch.cat([img_input, pad], dim=1)
@@ -212,20 +212,22 @@ def plot_random_z_trajectories(G, dataset, device, args, step):
     return fig
 
 
-def plot_cycle_trajectories(G, dataset, device, args, step):
+def plot_cycle_trajectories(G, ctrl_bank, device, args, step):
     """10 images x 6 cycles, each cycle = nca_steps with independent z."""
     G.eval()
     n_images = 10
     n_cycles = 6
     T = args.nca_steps
+    N = ctrl_bank.shape[0]
     dummy_cond = torch.zeros(1, dtype=torch.long, device=device)
 
     fig, axes = plt.subplots(n_images, n_cycles + 1, figsize=(3 * (n_cycles + 1), 3 * n_images))
 
     with torch.no_grad():
         for row in range(n_images):
-            idx = row * max(1, len(dataset) // n_images)
-            img, _ = dataset[idx]
+            idx = row * max(1, N // n_images)
+            raw = ctrl_bank[idx].float()
+            img = (raw + 0.5) / 255.0 * 2.0 - 1.0
             state = img.unsqueeze(0).to(device)
             if args.hidden_channels > 0:
                 pad = torch.zeros(1, args.hidden_channels,
@@ -357,29 +359,32 @@ def compute_fid(G, metadata_csv, image_dir, device, args):
 # Pool helpers
 # ---------------------------------------------------------------------------
 
-def populate_pool(pool, dataset, device, img_channels):
-    """Fill pool with ctrl images.  z is already random from ReplayPool init."""
+def populate_pool(pool, ctrl_bank, device, img_channels):
+    """Fill pool with ctrl images from preloaded bank.  z is random from init."""
+    N = ctrl_bank.shape[0]
     for i in range(pool.pool_size):
-        idx = np.random.randint(len(dataset))
-        img_input, _ = dataset[idx]
+        idx = np.random.randint(N)
+        img = ctrl_bank[idx].float()
+        img = (img + 0.5) / 255.0 * 2.0 - 1.0  # center-of-bin, no augment
         pool.states[i] = 0.0
-        pool.states[i, :img_channels] = img_input.to(device)
+        pool.states[i, :img_channels] = img.to(device)
     pool.iters.zero_()
-    # pool.z is already N(0,1) from __init__
 
 
-def recycle_pool_slots(pool, threshold, dataset, device, img_channels):
+def recycle_pool_slots(pool, threshold, ctrl_bank, device, img_channels):
     """Replace old pool slots with fresh ctrl + fresh random z."""
     mask = pool.iters > threshold
     if not mask.any():
         return 0
+    N = ctrl_bank.shape[0]
     idxs = mask.nonzero(as_tuple=True)[0]
     for idx in idxs:
         i = idx.item()
-        j = np.random.randint(len(dataset))
-        img_input, _ = dataset[j]
+        j = np.random.randint(N)
+        img = ctrl_bank[j].float()
+        img = (img + 0.5) / 255.0 * 2.0 - 1.0
         pool.states[i] = 0.0
-        pool.states[i, :img_channels] = img_input.to(device)
+        pool.states[i, :img_channels] = img.to(device)
         pool.z[i].normal_()
         pool.iters[i] = 0
     return len(idxs)
@@ -523,18 +528,27 @@ def train(args):
         device = torch.device("cpu")
     print(f"Device: {device}")
 
-    # Dataset (ctrl pairs: img_input for NCA, img_ref for D real)
+    # Preload all ctrl images into a single tensor (uint8 on CPU, augment on GPU)
     dataset = CtrlPairDataset(
         metadata_csv=args.metadata_csv,
         image_dir=args.image_dir,
         split="train",
         image_size=args.image_size,
+        augment=False,  # we'll augment ourselves after moving to GPU
     )
-    print(f"Dataset: {len(dataset)} ctrl images")
-
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
-                        num_workers=args.num_workers, pin_memory=True, drop_last=True)
-    data_iter = iter(loader)
+    # Stack all cached images into a contiguous tensor for fast indexing
+    _all_imgs = []
+    for key in dataset.ctrl_keys:
+        raw = dataset._cache[key]
+        if isinstance(raw, np.ndarray):
+            _all_imgs.append(torch.from_numpy(raw.astype(np.float32)).permute(2, 0, 1))
+        else:
+            _all_imgs.append(raw)
+    ctrl_bank = torch.stack(_all_imgs)  # [N, 3, H, W] uint8-scale floats
+    del _all_imgs, dataset._cache
+    N_ctrl = ctrl_bank.shape[0]
+    print(f"Ctrl bank: {N_ctrl} images, {ctrl_bank.shape}, "
+          f"{ctrl_bank.element_size() * ctrl_bank.nelement() / 1e6:.0f} MB")
 
     # Channels
     img_channels = 3
@@ -650,7 +664,7 @@ def train(args):
 
     # Populate pool from scratch if not resumed
     if use_pool and (not args.resume or not extra or "pool_state" not in extra):
-        populate_pool(pool, dataset, device, img_channels)
+        populate_pool(pool, ctrl_bank, device, img_channels)
         print(f"[pool] populated {args.pool_size} slots with fresh ctrl images")
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
@@ -665,16 +679,21 @@ def train(args):
 
     # --- Helpers ---
     use_intermediate = args.intermediate_weight > 0
-
-    def next_batch():
-        nonlocal data_iter
-        try:
-            return next(data_iter)
-        except StopIteration:
-            data_iter = iter(loader)
-            return next(data_iter)
-
     dummy_cond = torch.zeros(args.batch_size, dtype=torch.long, device=device)
+
+    def sample_ctrl_batch(B):
+        """Sample B random ctrl images from the preloaded bank, augment, move to GPU."""
+        idx = torch.randint(N_ctrl, (B,))
+        imgs = ctrl_bank[idx].clone()  # [B, 3, H, W] uint8-scale
+        # Dither + normalize to [-1, 1]
+        imgs = (imgs + torch.rand_like(imgs)) / 255.0
+        imgs = imgs * 2.0 - 1.0
+        # Random flips
+        if torch.rand(1).item() < 0.5:
+            imgs = imgs.flip(-1)
+        if torch.rand(1).item() < 0.5:
+            imgs = imgs.flip(-2)
+        return imgs.to(device)
 
     # --- Training loop ---
     pbar = tqdm(range(start_step, args.iterations), desc="Training",
@@ -685,10 +704,9 @@ def train(args):
         E.train()
 
         # ================ Sample batch ================
-        img_input, img_ref = next_batch()
-        img_input = img_input.to(device)
-        img_ref = img_ref.to(device)  # independent ctrl images for D real
-        B = img_input.shape[0]
+        B = args.batch_size
+        img_input = sample_ctrl_batch(B)
+        img_ref = sample_ctrl_batch(B)  # independent ctrl images for D real
         cond = dummy_cond[:B]
 
         # ================ D step ================
@@ -839,7 +857,7 @@ def train(args):
             if (step + 1) % args.pool_recycle_every == 0:
                 n_recycled = recycle_pool_slots(
                     pool, args.pool_recycle_threshold,
-                    dataset, device, img_channels)
+                    ctrl_bank, device, img_channels)
                 if n_recycled > 0:
                     print(f"[pool] recycled {n_recycled} slots at step {step+1}")
 
@@ -872,8 +890,8 @@ def train(args):
         # ================ Visualisations ================
         if (step + 1) % args.vis_every == 0:
             vis_G = G_ema.module if use_ema else G
-            fig_traj = plot_random_z_trajectories(vis_G, dataset, device, args, step + 1)
-            fig_cyc = plot_cycle_trajectories(vis_G, dataset, device, args, step + 1)
+            fig_traj = plot_random_z_trajectories(vis_G, ctrl_bank, device, args, step + 1)
+            fig_cyc = plot_cycle_trajectories(vis_G, ctrl_bank, device, args, step + 1)
             fig_gen = plot_image_grid(
                 [fake_img_g[i, :3].detach() for i in range(min(B, 16))],
                 f"Generated (step {step+1})")
