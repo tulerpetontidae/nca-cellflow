@@ -858,8 +858,8 @@ def train(args):
                         fake2 = G(nca_input, cond, n_steps=args.nca_steps, z=z2)
                     fake2_rgb = fake2[:, :img_channels].contiguous()
                 # Downsample to 12x12 to measure structural diversity, not pixel noise
-                fake1_down = F.avg_pool2d(fake_img_g, 4)
-                fake2_down = F.avg_pool2d(fake2_rgb, 4)
+                fake1_down = F.avg_pool2d(fake_img_g.float(), 4)
+                fake2_down = F.avg_pool2d(fake2_rgb.float(), 4)
                 div_loss = -(fake1_down - fake2_down.detach()).abs().mean()
                 total_loss = total_loss + div_w * div_loss
                 accum_div = div_loss.item()
