@@ -36,7 +36,8 @@ d_embed_dim: 32
 intermediate_weight: 0.5
 
 # training
-batch_size: 128
+batch_size: 64
+accumulate_steps: 2
 iterations: 160000
 lr_g: 0.0002
 lr_d: 0.0002

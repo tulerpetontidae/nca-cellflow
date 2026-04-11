@@ -28,7 +28,8 @@ ode_method: heun
 ode_nfe: 50
 
 # training
-batch_size: 128
+batch_size: 64
+accumulate_steps: 2
 iterations: 80000
 lr: 0.0001
 beta1: 0.9

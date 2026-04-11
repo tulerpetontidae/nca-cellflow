@@ -664,6 +664,8 @@ def make_parser():
     p.add_argument("--beta1", type=float, default=0.9)
     p.add_argument("--beta2", type=float, default=0.95)
     p.add_argument("--grad_clip", type=float, default=1.0)
+    p.add_argument("--accumulate_steps", type=int, default=1,
+                   help="Gradient accumulation steps (effective batch = batch_size * accumulate_steps)")
     p.add_argument("--ema_decay", type=float, default=0.999)
     p.add_argument("--ema_warmup_steps", type=int, default=1000)
 
@@ -873,51 +875,57 @@ def train(args):
     pbar = tqdm(range(start_step, args.iterations), desc="Training",
                 initial=start_step, total=args.iterations)
 
+    accum = args.accumulate_steps
+
     for step in pbar:
         model.train()
-
-        img_ctrl, img_trt, cpd_id = next_batch()
-        img_ctrl = img_ctrl.to(device)
-        img_trt = img_trt.to(device)
-        cpd_id = cpd_id.to(device)
-
-        # ---- Build conditioning (with CFG dropout) ----
-        fp_cond = fp_matrix[cpd_id]  # [B, fp_dim]
-
-        # CFG: drop conditioning with probability class_drop_prob
-        if torch.rand(1).item() < args.class_drop_prob:
-            fp_cond = None
-
-        # ---- Conditional OT flow matching ----
-        B = img_ctrl.shape[0]
-
-        # Sample timesteps
-        if args.skewed_timesteps:
-            t = skewed_timestep_sample(B, device=device)
-        else:
-            t = torch.rand(B, device=device)
-
-        # Source: ctrl image + optional noise
-        if torch.rand(1).item() > args.noise_prob:
-            x_0 = img_ctrl
-        else:
-            x_0 = img_ctrl + torch.randn_like(img_ctrl) * args.noise_level
-
-        # Target: treated image
-        x_1 = img_trt
-
-        # OT path: x_t = (1-t)*x_0 + t*x_1, velocity = x_1 - x_0
-        t_expand = t[:, None, None, None]
-        x_t = (1.0 - t_expand) * x_0 + t_expand * x_1
-        u_t = x_1 - x_0  # target velocity
-
-        # Forward pass
         optimizer.zero_grad(set_to_none=True)
-        with autocast():
-            v_pred = model(x_t, t, cond=fp_cond)
-            loss = torch.pow(v_pred - u_t, 2).mean()
+        accum_loss = 0.0
 
-        loss.backward()
+        for _ in range(accum):
+            img_ctrl, img_trt, cpd_id = next_batch()
+            img_ctrl = img_ctrl.to(device)
+            img_trt = img_trt.to(device)
+            cpd_id = cpd_id.to(device)
+
+            # ---- Build conditioning (with CFG dropout) ----
+            fp_cond = fp_matrix[cpd_id]  # [B, fp_dim]
+
+            # CFG: drop conditioning with probability class_drop_prob
+            if torch.rand(1).item() < args.class_drop_prob:
+                fp_cond = None
+
+            # ---- Conditional OT flow matching ----
+            B = img_ctrl.shape[0]
+
+            # Sample timesteps
+            if args.skewed_timesteps:
+                t = skewed_timestep_sample(B, device=device)
+            else:
+                t = torch.rand(B, device=device)
+
+            # Source: ctrl image + optional noise
+            if torch.rand(1).item() > args.noise_prob:
+                x_0 = img_ctrl
+            else:
+                x_0 = img_ctrl + torch.randn_like(img_ctrl) * args.noise_level
+
+            # Target: treated image
+            x_1 = img_trt
+
+            # OT path: x_t = (1-t)*x_0 + t*x_1, velocity = x_1 - x_0
+            t_expand = t[:, None, None, None]
+            x_t = (1.0 - t_expand) * x_0 + t_expand * x_1
+            u_t = x_1 - x_0  # target velocity
+
+            # Forward pass
+            with autocast():
+                v_pred = model(x_t, t, cond=fp_cond)
+                loss = torch.pow(v_pred - u_t, 2).mean() / accum
+
+            loss.backward()
+            accum_loss += loss.item()
+
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
         optimizer.step()
 
@@ -925,7 +933,7 @@ def train(args):
             ema.update()
 
         # ---- Logging ----
-        loss_val = loss.item()
+        loss_val = accum_loss
         logs["loss/flow_matching"].append(loss_val)
 
         log_dict = {"loss/flow_matching": loss_val}
