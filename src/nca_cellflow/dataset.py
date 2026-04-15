@@ -53,13 +53,21 @@ class IMPADataset(Dataset):
 
     def __init__(self, metadata_csv: str, image_dir: str, split: str = "train",
                  image_size: int = 96, plate_match: bool = False,
-                 balanced_cpd: bool = False, iter_trt: bool = False):
+                 balanced_cpd: bool = False, iter_trt: bool = False,
+                 exclude_compounds: list[str] | None = None):
         df = pd.read_csv(metadata_csv, index_col=0)
         df = df[df["SPLIT"] == split]
 
         # STATE: 0 = control (DMSO), 1 = treated
         ctrl = df[df["STATE"] == 0]
         trt = df[df["STATE"] == 1]
+
+        # OOD split: exclude specified compounds from treated set
+        if exclude_compounds:
+            n_before = len(trt)
+            trt = trt[~trt["CPD_NAME"].isin(exclude_compounds)]
+            print(f"[OOD] Excluded {n_before - len(trt)} treated images "
+                  f"({len(exclude_compounds)} compounds: {exclude_compounds})")
 
         self.ctrl_keys = ctrl["SAMPLE_KEY"].values
         self.trt_keys = trt["SAMPLE_KEY"].values
@@ -284,20 +292,38 @@ class EvalDataset(Dataset):
     """
 
     def __init__(self, metadata_csv: str, image_dir: str, split: str = "test",
-                 image_size: int = 96):
+                 image_size: int = 96,
+                 exclude_compounds: list[str] | None = None,
+                 only_compounds: list[str] | None = None,
+                 cpd2id: dict[str, int] | None = None):
         df = pd.read_csv(metadata_csv, index_col=0)
         df = df[df["SPLIT"] == split]
 
         ctrl = df[df["STATE"] == 0]
         trt = df[df["STATE"] == 1]
 
+        # OOD split: exclude or include specific compounds
+        if exclude_compounds:
+            trt = trt[~trt["CPD_NAME"].isin(exclude_compounds)]
+        if only_compounds:
+            trt = trt[trt["CPD_NAME"].isin(only_compounds)]
+
         self.ctrl_keys = ctrl["SAMPLE_KEY"].values
         self.trt_keys = trt["SAMPLE_KEY"].values
         self.trt_cpd = trt["CPD_NAME"].values
         self.trt_dose = trt["DOSE"].values.astype(np.float32)
 
-        cpds = sorted(set(self.trt_cpd))
-        self.cpd2id = {c: i for i, c in enumerate(cpds)}
+        if cpd2id is not None:
+            # Use provided base mapping, extend with any new compounds
+            self.cpd2id = dict(cpd2id)
+            next_id = max(cpd2id.values()) + 1 if cpd2id else 0
+            for c in sorted(set(self.trt_cpd)):
+                if c not in self.cpd2id:
+                    self.cpd2id[c] = next_id
+                    next_id += 1
+        else:
+            cpds = sorted(set(self.trt_cpd))
+            self.cpd2id = {c: i for i, c in enumerate(cpds)}
 
         self.image_dir = Path(image_dir)
         self.image_size = image_size

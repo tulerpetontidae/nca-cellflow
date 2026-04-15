@@ -317,17 +317,21 @@ _cpd_fid = None
 
 
 @torch.no_grad()
-def compute_fid(G, eval_dataset, device, args, id2cpd, img_channels, cond_fn=lambda x: x):
-    """Compute global and per-compound FID using torchmetrics.
+def compute_fid(G, eval_dataset, device, args, id2cpd, img_channels, cond_fn=lambda x: x,
+                moa_model=None, cpd_to_moa=None, moa2id=None):
+    """Compute global and per-compound FID + optional MoA accuracy.
 
     Uses EvalDataset: deterministic iteration over all treated test images,
     deterministic same-plate ctrl pairing, no augmentation.
-    Matches CellFlux evaluation protocol.
+    Images are generated ONCE and used for both FID and MoA.
+
+    Returns:
+        fid_global, fid_per_cpd, moa_results (or None if moa_model not provided)
     """
     global _global_fid, _cpd_fid
     if not FID_AVAILABLE:
         print("[warn] torchmetrics not available, skipping FID")
-        return None, None
+        return None, None, None
 
     try:
         if _global_fid is None:
@@ -342,6 +346,10 @@ def compute_fid(G, eval_dataset, device, args, id2cpd, img_channels, cond_fn=lam
         _global_fid.reset()
         per_cpd_real = defaultdict(list)
         per_cpd_fake = defaultdict(list)
+
+        # MoA collection
+        moa_preds, moa_labels, moa_is_ood = [], [], []
+        ood_set = set(getattr(args, 'exclude_compounds', None) or [])
 
         G.eval()
         for img_ctrl, img_trt, cpd_id, _dose in loader:
@@ -382,6 +390,19 @@ def compute_fid(G, eval_dataset, device, args, id2cpd, img_channels, cond_fn=lam
                 per_cpd_real[cid].append(real_01[i].cpu())
                 per_cpd_fake[cid].append(fake_01[i].cpu())
 
+            # MoA classification on same generated images
+            if moa_model is not None and cpd_to_moa is not None:
+                # Use unquantized [0,1] for MoA (Inception does its own preprocessing)
+                moa_input = (fake_rgb.clamp(-1, 1) + 1) / 2
+                preds = moa_model(moa_input).argmax(dim=1).cpu()
+                for i in range(cpd_id.shape[0]):
+                    cpd_name = id2cpd[cpd_id[i].item()]
+                    moa = cpd_to_moa.get(cpd_name)
+                    if moa and moa in moa2id:
+                        moa_preds.append(preds[i].item())
+                        moa_labels.append(moa2id[moa])
+                        moa_is_ood.append(cpd_name in ood_set)
+
         fid_global = _global_fid.compute().item()
 
         # Per-compound FID
@@ -399,14 +420,53 @@ def compute_fid(G, eval_dataset, device, args, id2cpd, img_channels, cond_fn=lam
             except Exception:
                 continue
 
+        # MoA results
+        moa_results = None
+        if moa_preds:
+            from sklearn.metrics import f1_score, confusion_matrix
+            id2moa = {v: k for k, v in moa2id.items()}
+            moa_preds = np.array(moa_preds)
+            moa_labels = np.array(moa_labels)
+            moa_is_ood = np.array(moa_is_ood)
+            moa_results = {
+                "accuracy": float((moa_preds == moa_labels).mean()),
+                "macro_f1": float(f1_score(moa_labels, moa_preds, average="macro", zero_division=0)),
+            }
+            if moa_is_ood.any():
+                id_mask = ~moa_is_ood
+                moa_results["accuracy_id"] = float((moa_preds[id_mask] == moa_labels[id_mask]).mean())
+                moa_results["accuracy_ood"] = float((moa_preds[moa_is_ood] == moa_labels[moa_is_ood]).mean())
+                moa_results["macro_f1_id"] = float(f1_score(moa_labels[id_mask], moa_preds[id_mask], average="macro", zero_division=0))
+                moa_results["macro_f1_ood"] = float(f1_score(moa_labels[moa_is_ood], moa_preds[moa_is_ood], average="macro", zero_division=0))
+            # Confusion matrix figure
+            classes = sorted(set(moa_labels) | set(moa_preds))
+            class_names = [id2moa[c] for c in classes]
+            cm = confusion_matrix(moa_labels, moa_preds, labels=classes)
+            cm_norm = cm.astype(float) / cm.sum(axis=1, keepdims=True).clip(min=1)
+            fig_cm, ax = plt.subplots(figsize=(10, 8))
+            ax.imshow(cm_norm, cmap="Blues", vmin=0, vmax=1)
+            for i in range(len(classes)):
+                for j in range(len(classes)):
+                    ax.text(j, i, f"{cm_norm[i, j]:.2f}", ha="center", va="center",
+                            fontsize=7, color="white" if cm_norm[i, j] > 0.5 else "black")
+            ax.set_xticks(range(len(classes)))
+            ax.set_yticks(range(len(classes)))
+            ax.set_xticklabels(class_names, rotation=45, ha="right", fontsize=8)
+            ax.set_yticklabels(class_names, fontsize=8)
+            ax.set_xlabel("Predicted")
+            ax.set_ylabel("True")
+            ax.set_title("MoA Confusion Matrix (row-normalized)")
+            plt.tight_layout()
+            moa_results["_confusion_matrix_fig"] = fig_cm
+
         G.train()
-        return fid_global, fid_per_cpd
+        return fid_global, fid_per_cpd, moa_results
 
     except Exception as e:
         print(f"[warn] FID computation failed: {e}")
         G.train()
         torch.cuda.empty_cache()
-        return None, None
+        return None, None, None
 
 
 _traj_fid = None
@@ -531,6 +591,8 @@ def make_parser() -> argparse.ArgumentParser:
                    help="Sample compounds uniformly (then image from that compound)")
     p.add_argument("--iter_trt", action="store_true",
                    help="Iterate over treated images, randomly sample ctrl (CellFlux paper style)")
+    p.add_argument("--exclude_compounds", type=str, nargs="+", default=None,
+                   help="Compounds to exclude from training (OOD split)")
 
     # model
     p.add_argument("--nca_type", type=str, default="base",
@@ -635,6 +697,8 @@ def make_parser() -> argparse.ArgumentParser:
                         "Measures ||dL/dx_t|| at each NCA step to diagnose gradient attenuation.")
     p.add_argument("--fid_every", type=int, default=0,
                    help="Compute FID every N steps (0 = disabled, uses all test treated images)")
+    p.add_argument("--moa_ckpt", type=str, default=None,
+                   help="Path to MoA classifier checkpoint (computed alongside FID if provided)")
     p.add_argument("--fid_trajectory_every", type=int, default=0,
                    help="Compute per-step FID trajectory every N steps (0 = disabled)")
     p.add_argument("--checkpoint_dir", type=str, default="checkpoints")
@@ -674,7 +738,7 @@ def load_config_into_args(args):
     for k, v in cfg.items():
         if hasattr(args, k) and getattr(args, k) == parser.get_default(k):
             # Cast to the argparse-declared type if needed
-            if k in type_map and not isinstance(v, type_map[k]):
+            if k in type_map and not isinstance(v, (list, type_map[k])):
                 v = type_map[k](v)
             setattr(args, k, v)
     return args
@@ -713,6 +777,7 @@ def train(args):
         plate_match=args.plate_match,
         balanced_cpd=args.balanced_cpd,
         iter_trt=getattr(args, 'iter_trt', False),
+        exclude_compounds=getattr(args, 'exclude_compounds', None),
     )
     num_compounds = len(dataset.cpd2id)
     id2cpd = {v: k for k, v in dataset.cpd2id.items()}
@@ -721,14 +786,41 @@ def train(args):
 
     # ---- eval dataset for FID (deterministic, no augmentation, test split) ----
     eval_dataset = None
+    eval_cond_fn = cond_fn
+    eval_id2cpd = id2cpd
     if args.fid_every > 0:
         eval_dataset = EvalDataset(
             metadata_csv=args.metadata_csv,
             image_dir=args.image_dir,
             split="test",
             image_size=args.image_size,
+            cpd2id=dataset.cpd2id,  # training IDs first, OOD appended
         )
+        eval_id2cpd = {v: k for k, v in eval_dataset.cpd2id.items()}
+        # Extend fp_matrix for eval if there are OOD compounds
+        if args.cond_type == "fingerprint" and len(eval_dataset.cpd2id) > num_compounds:
+            fp_df = pd.read_csv(args.fp_path, index_col=0)
+            eval_fp_vecs = []
+            for cid in range(len(eval_dataset.cpd2id)):
+                cpd_name = eval_id2cpd[cid]
+                eval_fp_vecs.append(fp_df.loc[cpd_name].values.astype(np.float32))
+            eval_fp_matrix = torch.tensor(np.stack(eval_fp_vecs)).to(device)
+            eval_cond_fn = make_cond_fn("fingerprint", eval_fp_matrix)
+            print(f"FID eval: extended fp_matrix {fp_matrix.shape} -> {eval_fp_matrix.shape} (OOD)")
         print(f"FID eval dataset: {len(eval_dataset)} treated test images")
+
+    # ---- MoA classifier (optional, computed alongside FID) ----
+    moa_model, moa2id, cpd_to_moa = None, None, None
+    if getattr(args, 'moa_ckpt', None) and args.fid_every > 0:
+        from nca_cellflow.models import MOAClassifier
+        moa_ckpt = torch.load(args.moa_ckpt, map_location="cpu", weights_only=False)
+        moa_model = MOAClassifier(num_classes=moa_ckpt["num_classes"]).to(device)
+        moa_model.load_state_dict_head(moa_ckpt["classifier_state"])
+        moa_model.eval()
+        moa2id = moa_ckpt["moa2id"]
+        meta_df = pd.read_csv(args.metadata_csv, index_col=0)
+        cpd_to_moa = meta_df[meta_df["STATE"] == 1].groupby("CPD_NAME")["ANNOT"].first().to_dict()
+        print(f"MoA classifier: {moa_ckpt['num_classes']} classes from {args.moa_ckpt}")
 
     # ---- fingerprint conditioning ----
     fp_matrix = None  # [num_compounds, fp_dim] tensor on device, or None
@@ -1382,24 +1474,43 @@ def train(args):
             for k, v in tex_stats.items():
                 logs[k].append(v)
 
-            # FID (test split)
+            # FID + MoA (test split, single generation pass)
             if eval_dataset is not None:
-                fid_global, fid_per_cpd = compute_fid(
-                    eval_G, eval_dataset, device, args, id2cpd, img_channels,
-                    cond_fn=cond_fn,
+                fid_global, fid_per_cpd, moa_results = compute_fid(
+                    eval_G, eval_dataset, device, args, eval_id2cpd, img_channels,
+                    cond_fn=eval_cond_fn,
+                    moa_model=moa_model, cpd_to_moa=cpd_to_moa, moa2id=moa2id,
                 )
                 if fid_global is not None:
                     eval_log["fid/global"] = fid_global
                     fid_vals = []
+                    fid_id, fid_ood = [], []
+                    ood_set = set(getattr(args, 'exclude_compounds', None) or [])
                     for cpd_name, fid_val in fid_per_cpd.items():
                         eval_log[f"fid/cpd/{cpd_name}"] = fid_val
                         logs[f"fid/cpd/{cpd_name}"].append(fid_val)
                         fid_vals.append(fid_val)
+                        if cpd_name in ood_set:
+                            fid_ood.append(fid_val)
+                        else:
+                            fid_id.append(fid_val)
                     if fid_vals:
                         mean_per_cpd = float(np.mean(fid_vals))
                         eval_log["fid/mean_per_cpd"] = mean_per_cpd
                         logs["fid/mean_per_cpd"].append(mean_per_cpd)
+                    if fid_ood:
+                        eval_log["fid/mean_ood"] = float(np.mean(fid_ood))
+                        eval_log["fid/mean_id"] = float(np.mean(fid_id))
                     logs["fid/global"].append(fid_global)
+                if moa_results is not None:
+                    for k, v in moa_results.items():
+                        if k.startswith("_"):
+                            continue  # skip internal keys
+                        eval_log[f"moa/{k}"] = v
+                    if use_wandb and "_confusion_matrix_fig" in moa_results:
+                        eval_log["moa/confusion_matrix"] = wandb.Image(moa_results["_confusion_matrix_fig"])
+                    if "_confusion_matrix_fig" in moa_results:
+                        plt.close(moa_results["_confusion_matrix_fig"])
 
             if use_wandb and eval_log:
                 wandb.log(eval_log, step=step + 1)

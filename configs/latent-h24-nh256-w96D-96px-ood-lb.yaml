@@ -1,0 +1,64 @@
+# LatentNCA, hidden24 + nca_hidden_dim=256 + w96D — 96px, OOD split
+# Steps 30→60 for 96px (2× spatial → 2× steps).
+# 8 compounds held out for generalization evaluation.
+
+# data
+metadata_csv: data/bbbc021_six/metadata/bbbc021_df_all.csv
+image_dir: data/bbbc021_six
+image_size: 96
+plate_match: true
+balanced_cpd: true
+exclude_compounds:
+  - docetaxel
+  - AZ841
+  - cytochalasin D
+  - simvastatin
+  - cyclohexamide
+  - latrunculin B
+  - epothilone B
+  - lactacystin
+
+# model
+nca_type: latent
+z_dim: 16
+nca_hidden_dim: 256
+nca_cond_dim: 32
+cond_type: fingerprint
+fp_path: data/bbbc021_six/metadata/emb_morgan_fp.csv
+hidden_channels: 24
+fire_rate: 1.0
+nca_steps: 60
+step_size: 0.08
+use_tanh: true
+
+# discriminator (w96D)
+d_stages: 3
+d_base_channels: 96
+d_blocks: 3
+d_cardinality: 4
+d_expansion: 2
+d_kernel_size: 3
+d_embed_dim: 32
+
+# training
+batch_size: 64
+accumulate_steps: 2
+iterations: 160000
+lr_g: 0.0002
+lr_d: 0.0002
+beta1: 0.0
+beta2: 0.99
+gamma: 1.0
+grad_clip: 1.0
+ema_decay: 0.999
+ema_warmup_steps: 1000
+
+# eval
+moa_ckpt: checkpoints/moa_classifier_96px/best.pt
+
+# misc
+num_workers: 8
+save_every: 5000
+vis_every: 1000
+fid_every: 5000
+wandb_project: nca-cellflow

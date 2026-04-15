@@ -1,0 +1,58 @@
+# CellFlux (flow matching + UNet) — 96px, OOD split
+# 8 compounds held out for generalization evaluation.
+
+# data
+metadata_csv: data/bbbc021_six/metadata/bbbc021_df_all.csv
+image_dir: data/bbbc021_six
+image_size: 96
+plate_match: true
+iter_trt: true
+fp_path: data/bbbc021_six/metadata/emb_morgan_fp.csv
+exclude_compounds:
+  - docetaxel
+  - AZ841
+  - cytochalasin D
+  - simvastatin
+  - cyclohexamide
+  - latrunculin B
+  - epothilone B
+  - lactacystin
+
+# model
+model_channels: 128
+num_res_blocks: 4
+dropout: 0.3
+channel_mult: [2, 2, 2]
+attention_resolutions: [2]
+condition_dim: 1024
+
+# flow matching
+noise_level: 0.5
+noise_prob: 0.5
+class_drop_prob: 0.2
+cfg_scale: 1.2
+skewed_timesteps: true
+edm_schedule: true
+ode_method: heun
+ode_nfe: 50
+
+# training
+batch_size: 64
+accumulate_steps: 2
+iterations: 80000
+lr: 0.0001
+beta1: 0.9
+beta2: 0.95
+grad_clip: 1.0
+ema_decay: 0.999
+ema_warmup_steps: 1000
+
+# eval
+moa_ckpt: checkpoints/moa_classifier_96px/best.pt
+
+# misc
+num_workers: 8
+save_every: 5000
+vis_every: 5000
+fid_every: 5000
+wandb_project: nca-cellflow
