@@ -11,6 +11,7 @@ from .impa import (
     IMPAGenerator, IMPAMappingNetwork, IMPAStyleEncoder, IMPADiscriminator, he_init,
 )
 from .classifiers import DiscriminatorClassifier, StyleEncoderClassifier
+from .moa_classifier import MOAClassifier
 
 __all__ = [
     "BaseNCA", "NoiseNCA", "LatentNCA", "NCAStyleEncoder", "ResBlkStyleEncoder", "GradientSensor",
@@ -19,4 +20,5 @@ __all__ = [
     "IMPAGenerator", "IMPAMappingNetwork", "IMPAStyleEncoder", "IMPADiscriminator",
     "he_init",
     "DiscriminatorClassifier", "StyleEncoderClassifier",
+    "MOAClassifier",
 ]
