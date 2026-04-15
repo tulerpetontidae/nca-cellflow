@@ -565,7 +565,7 @@ def compute_fid(model, eval_dataset, device, args, id2cpd, fp_matrix,
             cpd_id = cpd_id.to(device)
 
             cond = fp_matrix[cpd_id].to(device)
-            x_0 = img_ctrl
+            x_0 = img_ctrl + torch.randn_like(img_ctrl) * args.noise_level
             fake = ode_fn(model, x_0, time_grid.to(device), cond=cond, cfg_scale=cfg_scale)
             fake_rgb = fake[:, :3].contiguous()
 
@@ -1050,7 +1050,7 @@ def train(args):
             try:
                 with torch.no_grad():
                     cond_tex = fp_matrix[cpd_id].to(device)
-                    x_0_tex = img_ctrl  # clean init for eval
+                    x_0_tex = img_ctrl + torch.randn_like(img_ctrl) * args.noise_level
                     tex_fake = ode_fn(
                         model, x_0_tex, time_grid.to(device),
                         cond=cond_tex, cfg_scale=args.cfg_scale,

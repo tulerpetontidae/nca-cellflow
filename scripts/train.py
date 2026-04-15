@@ -784,44 +784,6 @@ def train(args):
     print(f"Dataset: {len(dataset)} control images, {len(dataset.trt_keys)} treated images, "
           f"{num_compounds} compounds")
 
-    # ---- eval dataset for FID (deterministic, no augmentation, test split) ----
-    eval_dataset = None
-    eval_cond_fn = cond_fn
-    eval_id2cpd = id2cpd
-    if args.fid_every > 0:
-        eval_dataset = EvalDataset(
-            metadata_csv=args.metadata_csv,
-            image_dir=args.image_dir,
-            split="test",
-            image_size=args.image_size,
-            cpd2id=dataset.cpd2id,  # training IDs first, OOD appended
-        )
-        eval_id2cpd = {v: k for k, v in eval_dataset.cpd2id.items()}
-        # Extend fp_matrix for eval if there are OOD compounds
-        if args.cond_type == "fingerprint" and len(eval_dataset.cpd2id) > num_compounds:
-            fp_df = pd.read_csv(args.fp_path, index_col=0)
-            eval_fp_vecs = []
-            for cid in range(len(eval_dataset.cpd2id)):
-                cpd_name = eval_id2cpd[cid]
-                eval_fp_vecs.append(fp_df.loc[cpd_name].values.astype(np.float32))
-            eval_fp_matrix = torch.tensor(np.stack(eval_fp_vecs)).to(device)
-            eval_cond_fn = make_cond_fn("fingerprint", eval_fp_matrix)
-            print(f"FID eval: extended fp_matrix {fp_matrix.shape} -> {eval_fp_matrix.shape} (OOD)")
-        print(f"FID eval dataset: {len(eval_dataset)} treated test images")
-
-    # ---- MoA classifier (optional, computed alongside FID) ----
-    moa_model, moa2id, cpd_to_moa = None, None, None
-    if getattr(args, 'moa_ckpt', None) and args.fid_every > 0:
-        from nca_cellflow.models import MOAClassifier
-        moa_ckpt = torch.load(args.moa_ckpt, map_location="cpu", weights_only=False)
-        moa_model = MOAClassifier(num_classes=moa_ckpt["num_classes"]).to(device)
-        moa_model.load_state_dict_head(moa_ckpt["classifier_state"])
-        moa_model.eval()
-        moa2id = moa_ckpt["moa2id"]
-        meta_df = pd.read_csv(args.metadata_csv, index_col=0)
-        cpd_to_moa = meta_df[meta_df["STATE"] == 1].groupby("CPD_NAME")["ANNOT"].first().to_dict()
-        print(f"MoA classifier: {moa_ckpt['num_classes']} classes from {args.moa_ckpt}")
-
     # ---- fingerprint conditioning ----
     fp_matrix = None  # [num_compounds, fp_dim] tensor on device, or None
     fp_dim = 1024
@@ -890,6 +852,42 @@ def train(args):
 
     # Conditioning function: maps cpd_id -> G conditioning input
     cond_fn = make_cond_fn(args.cond_type, fp_matrix)
+
+    # ---- eval dataset for FID (deterministic, no augmentation, test split) ----
+    eval_dataset = None
+    eval_cond_fn = cond_fn
+    eval_id2cpd = id2cpd
+    if args.fid_every > 0:
+        eval_dataset = EvalDataset(
+            metadata_csv=args.metadata_csv,
+            image_dir=args.image_dir,
+            split="test",
+            image_size=args.image_size,
+            cpd2id=dataset.cpd2id,
+        )
+        eval_id2cpd = {v: k for k, v in eval_dataset.cpd2id.items()}
+        if args.cond_type == "fingerprint" and len(eval_dataset.cpd2id) > num_compounds:
+            eval_fp_vecs = []
+            for cid in range(len(eval_dataset.cpd2id)):
+                cpd_name = eval_id2cpd[cid]
+                eval_fp_vecs.append(fp_df.loc[cpd_name].values.astype(np.float32))
+            eval_fp_matrix = torch.tensor(np.stack(eval_fp_vecs)).to(device)
+            eval_cond_fn = make_cond_fn("fingerprint", eval_fp_matrix)
+            print(f"FID eval: extended fp_matrix {fp_matrix.shape} -> {eval_fp_matrix.shape} (OOD)")
+        print(f"FID eval dataset: {len(eval_dataset)} treated test images")
+
+    # ---- MoA classifier (optional, computed alongside FID) ----
+    moa_model, moa2id, cpd_to_moa = None, None, None
+    if getattr(args, 'moa_ckpt', None) and args.fid_every > 0:
+        from nca_cellflow.models import MOAClassifier
+        moa_ckpt = torch.load(args.moa_ckpt, map_location="cpu", weights_only=False)
+        moa_model = MOAClassifier(num_classes=moa_ckpt["num_classes"]).to(device)
+        moa_model.load_state_dict_head(moa_ckpt["classifier_state"])
+        moa_model.eval()
+        moa2id = moa_ckpt["moa2id"]
+        meta_df = pd.read_csv(args.metadata_csv, index_col=0)
+        cpd_to_moa = meta_df[meta_df["STATE"] == 1].groupby("CPD_NAME")["ANNOT"].first().to_dict()
+        print(f"MoA classifier: {moa_ckpt['num_classes']} classes from {args.moa_ckpt}")
 
     if args.compile:
         G = torch.compile(G)
